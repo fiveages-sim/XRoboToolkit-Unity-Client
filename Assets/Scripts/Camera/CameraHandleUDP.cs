@@ -29,7 +29,7 @@ namespace Robot
         public void captureOnStateChanged(int state)
         {
             Debug.Log($"[PXRCapture] State Changed: {state}");
-            UnityMainThreadDispatcher.Instance().Enqueue(() => { captureOnStateChangedInternal(state); });
+            UnityMainThreadDispatcher.Enqueue(() => { captureOnStateChangedInternal(state); });
         }
 
         private async void captureOnStateChangedInternal(int state)

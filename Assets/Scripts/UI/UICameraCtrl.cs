@@ -44,11 +44,20 @@ public partial class UICameraCtrl : MonoBehaviour
     public Toggle trackingToggle;
     public Toggle visionToggle;
 
+    private readonly Robot.VisionTrackingSession _session = new Robot.VisionTrackingSession();
+
+    private bool _recordTrackingData
+    {
+        get { return _session.TrackingWriteEnabled; }
+        set { _session.TrackingWriteEnabled = value; }
+    }
+
     private void Awake()
     {
         RecordBtn.OnChange += OnRecordBtn;
         TcpHandler.ReceiveFunctionEvent += OnNetReceive;
         CameraHandle.AddStateListener(OnCameraStateChanged);
+        UnityMainThreadDispatcher.Instance();
 
         // Refactoring
         listenBtn.OnChange += OnListenCameraBtn;
@@ -205,7 +214,45 @@ public partial class UICameraCtrl : MonoBehaviour
 
     private void OnCameraStateChanged(int state)
     {
-        CameraStatusText.text = state.ToString();
+        if (CameraStatusText != null)
+        {
+            CameraStatusText.text = state + " " + Robot.CapturePipeline.StateName(state);
+        }
+
+        _session.NoteCaptureState(state);
+    }
+
+    public void SetRecordVisual(string phase)
+    {
+        if (RecordBtn == null)
+        {
+            return;
+        }
+
+        if (phase == "starting")
+        {
+            RecordBtn.SetVisual(true, false, "Starting...");
+        }
+        else if (phase == "recording")
+        {
+            RecordBtn.SetVisual(true, true, "Recording");
+        }
+        else if (phase == "stopping")
+        {
+            RecordBtn.SetVisual(true, false, "Stopping...");
+        }
+        else
+        {
+            RecordBtn.SetVisual(false, false, "Record");
+        }
+    }
+
+    public void SetCameraStatus(string text)
+    {
+        if (CameraStatusText != null)
+        {
+            CameraStatusText.text = text;
+        }
     }
 
 
@@ -213,12 +260,21 @@ public partial class UICameraCtrl : MonoBehaviour
     {
         TcpHandler.ReceiveFunctionEvent -= OnNetReceive;
         CameraHandle.RemoveStateListener(OnCameraStateChanged);
+        if (_session.IsActive)
+        {
+            _session.RequestStop("object destroyed");
+        }
     }
 
     private void OnRecordBtn(bool on)
     {
         if (on)
         {
+            if (_session.IsActive)
+            {
+                return;
+            }
+
             OpenRecord();
         }
         else
@@ -261,10 +317,7 @@ public partial class UICameraCtrl : MonoBehaviour
         {
             if (trackingToggle.isOn)
             {
-                // Only tracking data, use fixed resolution
-                _recordTrackingData = true;
-                OnStartRecordTracking(2160, 810);
-                RecordBtn.SetOn(true);
+                _session.Begin(this, 2160, 810, 30, 0, false, true);
             }
         }
     }
@@ -272,32 +325,7 @@ public partial class UICameraCtrl : MonoBehaviour
     private void StartRecord(int width, int height, int fps, int bitrate,
         bool onTrackingData)
     {
-        LogWindow.Info($"Start record {width}x{height}@{fps} fps {bitrate} bps Tracking: {onTrackingData}");
-        //The VR camera image acquisition is only effective on the B-end device of Pico4U.
-        if (!Utils.IsPico4U())
-        {
-            Toast.Show("Please use B-end pico4U devices and apply for camera permissions.");
-            return;
-        }
-
-        Toast.Show("Start Record");
-        Debug.Log("StartRecord:" + width + "," + height + "," + fps + "," + bitrate + "," + onTrackingData);
-        CameraHandle.StartCameraPreview(width, height, fps, bitrate, 0,
-            (int)PXRCaptureRenderMode.PXRCapture_RenderMode_3D,
-            () =>
-            {
-                string timeStamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
-                string trackingFileName = $"CameraRecord_{timeStamp}.mp4";
-                string filePath = Path.Combine("/sdcard/Download/", trackingFileName);
-                LogWindow.Warn("Vision file path: " + filePath);
-                CameraHandle.StartRecord(filePath);
-                _recordTrackingData = onTrackingData;
-                if (_recordTrackingData)
-                    OnStartRecordTracking(width, height);
-            });
-
-        RecordBtn.SetOn(true);
-        // PreviewCameraTog.gameObject.SetActive(true);
+        _session.Begin(this, width, height, fps, bitrate, true, onTrackingData);
     }
 
     public void UpdateCameraParamsNew()
@@ -328,17 +356,7 @@ public partial class UICameraCtrl : MonoBehaviour
 
     private void StopRecord()
     {
-        Debug.Log(this + "StopRecord");
-        LogWindow.Info("Stop record");
-        if (_writer != null)
-        {
-            _writer.Close();
-            _writer = null;
-        }
-
-        CameraHandle.StopPreview();
-        CameraHandle.CloseCamera();
-        RecordBtn.SetOn(false);
+        _session.RequestStop("user");
     }
 
     private void StopSendImage()
@@ -355,63 +373,20 @@ public partial class UICameraCtrl : MonoBehaviour
         TcpHandler.SendFunctionValue("requestCameraList", "");
     }
 
-    private StreamWriter _writer;
-    private bool _recordTrackingData = false;
-    private JsonData _trackingJsonData = new JsonData();
-    private TrackingData _trackingData = new TrackingData();
-
-    private void OnStartRecordTracking(int width, int height)
-    {
-        LogWindow.Info($"Start record tracking data: {width}x{height}");
-        Debug.Log("OnStartRecordTracking");
-        string timeStamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
-        string trackingFileName = $"trackingData_{timeStamp}.txt";
-        string filePath = Path.Combine("/sdcard/Download/", trackingFileName);
-        Debug.Log("trackingFilePath:" + filePath);
-        LogWindow.Warn("Tracking file path:" + filePath);
-        _writer = new StreamWriter(filePath, true);
-        _writer.AutoFlush = true; // Enable automatic refresh to prevent data loss
-
-        JsonData cameraParam = new JsonData();
-        long nsTime = Utils.GetCurrentTimestamp();
-        cameraParam["notice"] =
-            "This is the timestamp and head pose information when obtaining the image for the first frame.";
-        cameraParam["timeStampNs"] = nsTime;
-        //Convert coordinate system to right-handed system (X right, Y up, Z in)
-
-        string cameraExtrinsics = CameraHandle.GetCameraExtrinsics();
-        string cameraIntrinsics = CameraHandle.GetCameraIntrinsics(width, height);
-        cameraParam["cameraExtrinsics"] = cameraExtrinsics;
-        cameraParam["cameraIntrinsics"] = cameraIntrinsics;
-        _writer.WriteLine(cameraParam.ToJson());
-    }
-
     private void Update()
     {
+        _session.Pump();
         if (_recordTrackingData)
         {
-            if (_writer != null)
-            {
-                _trackingData.Get(ref _trackingJsonData);
-                _writer.WriteLine(_trackingJsonData.ToJson());
-            }
+            _session.WriteTrackingSample();
         }
     }
 
     private void OnApplicationPause(bool pauseStatus)
     {
-        if (CameraHandle.GetCaptureState() == (int)PXRCaptureState.CAPTURE_STATE_CAMERA_OPENING)
+        if (pauseStatus && _session.IsActive)
         {
-            if (pauseStatus)
-            {
-                //release camera
-                CameraHandle.CloseCamera();
-            }
-            else
-            {
-                //reopen camera
-                CameraHandle.OpenCamera();
-            }
+            _session.RequestStop("application paused");
         }
     }
 }

@@ -16,6 +16,35 @@ namespace Robot
             return currentTimestamp;
         }
 
+        /// <summary>
+        /// CLOCK_BOOTTIME nanoseconds from android.os.SystemClock.elapsedRealtimeNanos.
+        /// This is the same clock family as PICO Frame.timestamp (exposure start, ns, BOOTTIME).
+        /// It is not Unix time and it is not MediaCodec PTS.
+        /// </summary>
+        private static AndroidJavaClass _elapsedClock;
+
+        public static long GetElapsedRealtimeNs()
+        {
+#if UNITY_ANDROID && !UNITY_EDITOR
+            try
+            {
+                if (_elapsedClock == null)
+                {
+                    _elapsedClock = new AndroidJavaClass("android.os.SystemClock");
+                }
+
+                return _elapsedClock.CallStatic<long>("elapsedRealtimeNanos");
+            }
+            catch (Exception exception)
+            {
+                Debug.LogWarning("[Utils] elapsedRealtimeNanos failed: " + exception.Message);
+                return 0;
+            }
+#else
+            return 0;
+#endif
+        }
+
         //Obtain the local IPv4 address
         public static string GetLocalIPv4()
         {

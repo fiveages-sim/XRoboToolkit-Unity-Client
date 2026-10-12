@@ -19,25 +19,47 @@ public class UnityMainThreadDispatcher : MonoBehaviour
         return _instance;
     }
 
-    public void Enqueue(Action action)
+    public static void Enqueue(Action action)
     {
+        if (action == null)
+        {
+            return;
+        }
+
         lock (_executionQueue)
         {
             _executionQueue.Enqueue(action);
         }
     }
 
+    public void EnqueueInstance(Action action)
+    {
+        Enqueue(action);
+    }
+
     void Update()
     {
-        while (_executionQueue.Count > 0)
+        while (true)
         {
             Action action;
             lock (_executionQueue)
             {
+                if (_executionQueue.Count == 0)
+                {
+                    break;
+                }
+
                 action = _executionQueue.Dequeue();
             }
 
-            action?.Invoke();
+            try
+            {
+                action?.Invoke();
+            }
+            catch (Exception exception)
+            {
+                Debug.LogError("[UnityMainThreadDispatcher] " + exception);
+            }
         }
     }
 }
