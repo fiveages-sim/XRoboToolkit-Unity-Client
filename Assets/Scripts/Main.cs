@@ -7,13 +7,12 @@ using Robot;
 
 public class Main : MonoBehaviour
 {
-    // Pose collection does not require the VST camera.  Keep it opt-in because
-    // the device-side VST/black-screen recovery path was the only path that
-    // correlated with the multi-GB native memory climb in our logs.
-    [SerializeField] private bool enableVstCamera = false;
+    // Compositor passthrough behind the floating panel. This only calls
+    // PXR_Manager.EnableVideoSeeThrough. It does not call OpenVSTCamera:
+    // that acquires frames in-process, was tied to the native memory climb,
+    // and is a different camera client from capturelib recording.
+    [SerializeField] private bool showPassthroughOutsidePanel = true;
     [SerializeField] private float eyeTextureResolutionScale = 1.0f;
-
-    private bool _vstCameraOpen;
 
     private void Awake()
     {
@@ -22,8 +21,8 @@ public class Main : MonoBehaviour
         Application.logMessageReceived += OnLogMessageReceived;
         float clampedEyeTextureScale = Mathf.Clamp(eyeTextureResolutionScale, 0.7f, 1.0f);
         XRSettings.eyeTextureResolutionScale = clampedEyeTextureScale;
-        PXR_Manager.EnableVideoSeeThrough = enableVstCamera;
-        Debug.Log($"Main memory guard: VST={enableVstCamera}, eyeTextureResolutionScale={clampedEyeTextureScale:F2}");
+        ApplyPassthroughBackground(showPassthroughOutsidePanel, "Awake");
+        Debug.Log($"Main passthrough outside panel={showPassthroughOutsidePanel}, eyeTextureResolutionScale={clampedEyeTextureScale:F2}");
         //Closing the security fence is only effective on B-end devices.
         PXR_Enterprise.SwitchSystemFunction(SystemFunctionSwitchEnum.SFS_SECURITY_ZONE_PERMANENTLY, SwitchEnum.S_OFF);
     }
@@ -39,12 +38,12 @@ public class Main : MonoBehaviour
 
     private void OnEnable()
     {
-        SetVstCameraEnabled(enableVstCamera, "OnEnable");
+        ApplyPassthroughBackground(showPassthroughOutsidePanel, "OnEnable");
     }
 
     private void OnDisable()
     {
-        SetVstCameraEnabled(false, "OnDisable");
+        ApplyPassthroughBackground(false, "OnDisable");
     }
 
     private void OnApplicationPause(bool pauseStatus)
@@ -52,7 +51,7 @@ public class Main : MonoBehaviour
         Debug.Log("OnApplicationPause " + pauseStatus);
         if (pauseStatus)
         {
-            SetVstCameraEnabled(false, "pause");
+            ApplyPassthroughBackground(false, "pause");
             PXR_Enterprise.SwitchSystemFunction(SystemFunctionSwitchEnum.SFS_SECURITY_ZONE_PERMANENTLY,
                 SwitchEnum.S_ON);
         }
@@ -61,37 +60,31 @@ public class Main : MonoBehaviour
             //Closing the security fence is only effective on B-end devices.
             PXR_Enterprise.SwitchSystemFunction(SystemFunctionSwitchEnum.SFS_SECURITY_ZONE_PERMANENTLY,
                 SwitchEnum.S_OFF);
-            SetVstCameraEnabled(enableVstCamera, "resume");
+            ApplyPassthroughBackground(showPassthroughOutsidePanel, "resume");
         }
     }
 
-    private void SetVstCameraEnabled(bool enabled, string reason)
+    private void ApplyPassthroughBackground(bool enabled, string reason)
     {
         if (Application.platform != RuntimePlatform.Android)
         {
             return;
         }
 
-        if (enabled == _vstCameraOpen && PXR_Manager.EnableVideoSeeThrough == enabled)
+        Camera headsetCamera = Camera.main;
+        if (headsetCamera != null)
         {
-            Debug.Log($"Main VST unchanged: enabled={enabled}, reason={reason}");
+            headsetCamera.clearFlags = CameraClearFlags.SolidColor;
+            headsetCamera.backgroundColor = new Color(0f, 0f, 0f, 0f);
+        }
+
+        if (PXR_Manager.EnableVideoSeeThrough == enabled)
+        {
+            Debug.Log($"Main passthrough unchanged: enabled={enabled}, reason={reason}");
             return;
         }
 
-        if (enabled)
-        {
-            PXR_Manager.EnableVideoSeeThrough = true;
-            bool openResult = PXR_Enterprise.OpenVSTCamera();
-            _vstCameraOpen = openResult;
-            Debug.Log($"Main VST open: result={openResult}, reason={reason}");
-            return;
-        }
-
-        // Disable the compositor background before closing the camera so a
-        // resume/black-screen transition cannot keep a stale VST layer alive.
-        PXR_Manager.EnableVideoSeeThrough = false;
-        bool closeResult = PXR_Enterprise.CloseVSTCamera();
-        _vstCameraOpen = !closeResult;
-        Debug.Log($"Main VST close: result={closeResult}, reason={reason}");
+        PXR_Manager.EnableVideoSeeThrough = enabled;
+        Debug.Log($"Main passthrough background: enabled={enabled}, reason={reason}");
     }
 }

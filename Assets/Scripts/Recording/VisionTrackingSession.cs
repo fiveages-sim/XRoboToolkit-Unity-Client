@@ -131,10 +131,13 @@ namespace Robot
             _meta = new JsonData();
             _meta["sessionId"] = SessionId;
             _meta["mode"] = ModeName();
+            _meta["imageCapturePath"] = vision ? "vision-capturelib" : "none";
+            _meta["exp_Image"] = 0;
             _meta["requestUtc"] = _requestUtc;
             _meta["width"] = width;
             _meta["height"] = height;
             _meta["fps"] = fps;
+            _meta["requested_fps"] = fps;
             _meta["bitrate"] = bitrate;
             _meta["status"] = "starting";
             _meta["syncHint"] = SyncHint();
@@ -143,6 +146,7 @@ namespace Robot
             LogEvent("RecordRequested",
                 "mode=" + ModeName() + " " + width + "x" + height + "@" + fps + " bitrate=" + bitrate, false);
             SetVisual("starting");
+            SetStatus("Starting");
 
             if (_vision && !Utils.IsPico4U())
             {
@@ -416,6 +420,11 @@ namespace Robot
             Phase = RecordingSessionPhase.CameraReady;
             _cameraReadyUtc = DateTime.UtcNow.ToString("o");
             _meta["cameraReadyUtc"] = _cameraReadyUtc;
+            _meta["eisDisableResult"] = CameraHandle.LastEisDisableResult;
+            _meta["fovNote"] =
+                "3D side-by-side keeps each eye at 4:3, the same aspect as the capture sensor. " +
+                "SetConfig enables EIS, which crops the frame; EIS is turned off after SetConfig. " +
+                "eisDisableResult 1 is native success.";
             SetStatus("Camera ready");
             try
             {
@@ -943,7 +952,7 @@ namespace Robot
         {
             if (_host != null)
             {
-                _host.SetCameraStatus(text);
+                _host.SetRecordStatus(text);
             }
         }
 

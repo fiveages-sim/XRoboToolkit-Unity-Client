@@ -39,6 +39,7 @@ namespace Robot
         public static int LastOpenResult { get; private set; } = int.MinValue;
         public static int LastCallbackRegisterResult { get; private set; } = int.MinValue;
         public static int LastStartPreviewResult { get; private set; } = int.MinValue;
+        public static int LastEisDisableResult { get; private set; } = int.MinValue;
         public static bool OpenSucceeded { get; private set; }
         public static bool PreviewEverStarted => _flags.PreviewEverStarted;
         public static bool ConfigApplied => _flags.ConfigApplied;
@@ -154,7 +155,17 @@ namespace Robot
                 "source=" + source + " enableMvHevc=" + _enableMvHevc + " fps=" + _fps +
                 " note=java-SetConfig-discards-native-configure-int");
             GetJavaObject().Call("SetConfig", _enableMvHevc, _fps);
-            LogPipeline("SetConfigResult", "source=" + source + " result=invoked");
+            LastEisDisableResult = DisableElectronicStabilization();
+            LogPipeline("SetConfigResult", "source=" + source + " result=invoked eisDisableResult=" + LastEisDisableResult +
+                                           " note=SetConfig-forces-enableEIS-true-then-we-disable-it-to-keep-full-fov");
+        }
+
+        private static int DisableElectronicStabilization()
+        {
+            using (AndroidJavaClass opener = new AndroidJavaClass("com.xrobotoolkit.enterprise.CaptureOpener"))
+            {
+                return opener.CallStatic<int>("disableElectronicStabilization", GetJavaObject());
+            }
         }
 
         private static void ApplyPreview(string source)

@@ -29,6 +29,7 @@ public partial class UICameraCtrl : MonoBehaviour
 
     private JsonData _recordJson;
     public Text CameraStatusText;
+    public Text RecordStatusText;
 
     public CustomButton listenBtn;
     public VideoSourceManager videoSourceManager;
@@ -45,11 +46,22 @@ public partial class UICameraCtrl : MonoBehaviour
     public Toggle visionToggle;
 
     private readonly Robot.VisionTrackingSession _session = new Robot.VisionTrackingSession();
+    private readonly Robot.ApiFrameSession _apiSession = new Robot.ApiFrameSession();
+    private bool _useApiCapture;
 
     private bool _recordTrackingData
     {
-        get { return _session.TrackingWriteEnabled; }
-        set { _session.TrackingWriteEnabled = value; }
+        get
+        {
+            return _useApiCapture ? _apiSession.TrackingWriteEnabled : _session.TrackingWriteEnabled;
+        }
+        set
+        {
+            if (!_useApiCapture)
+            {
+                _session.TrackingWriteEnabled = value;
+            }
+        }
     }
 
     private void Awake()
@@ -58,6 +70,9 @@ public partial class UICameraCtrl : MonoBehaviour
         TcpHandler.ReceiveFunctionEvent += OnNetReceive;
         CameraHandle.AddStateListener(OnCameraStateChanged);
         UnityMainThreadDispatcher.Instance();
+        EnsureRecordStatusText();
+        SetRemoteVisionStatus("Idle");
+        SetRecordStatus("Idle");
 
         // Refactoring
         listenBtn.OnChange += OnListenCameraBtn;
@@ -134,7 +149,11 @@ public partial class UICameraCtrl : MonoBehaviour
         if (on)
         {
             // check if the dropdown is updated
-            if (cameraDropdown.options == null || cameraDropdown.options.Count == 0) return;
+            if (cameraDropdown.options == null || cameraDropdown.options.Count == 0)
+            {
+                SetRemoteVisionStatus("Idle");
+                return;
+            }
 
             // get the camera source from the dropdown
             var cameraSource = cameraDropdown.options[cameraDropdown.value].text;
@@ -142,12 +161,14 @@ public partial class UICameraCtrl : MonoBehaviour
             // Update camera source, including shaders, etc.
             videoSourceManager.UpdateVideoSource(cameraSource);
 
+            SetRemoteVisionStatus("Requesting");
             // send video stream request to the server
             CameraSendInputDialog.Show(RequestCameraStream);
         }
         else
         {
             RemoteCameraWindowObj.SetActive(false);
+            SetRemoteVisionStatus("Idle");
         }
 
         // Update button
@@ -172,6 +193,7 @@ public partial class UICameraCtrl : MonoBehaviour
         // Get camera parameters
         var camPara = VideoSourceConfigManager.Instance.CameraParameters;
 
+        SetRemoteVisionStatus("Listening");
         // Start listening to the camera
         RemoteCameraWindowObj.SetActive(true);
         RemoteCameraWindowObj.GetComponent<RemoteCameraWindow>().StartListen(camPara.width, camPara.height, camPara.fps,
@@ -214,11 +236,6 @@ public partial class UICameraCtrl : MonoBehaviour
 
     private void OnCameraStateChanged(int state)
     {
-        if (CameraStatusText != null)
-        {
-            CameraStatusText.text = state + " " + Robot.CapturePipeline.StateName(state);
-        }
-
         _session.NoteCaptureState(state);
     }
 
@@ -247,12 +264,59 @@ public partial class UICameraCtrl : MonoBehaviour
         }
     }
 
-    public void SetCameraStatus(string text)
+    public void SetRemoteVisionStatus(string text)
     {
         if (CameraStatusText != null)
         {
             CameraStatusText.text = text;
         }
+    }
+
+    public void SetRecordStatus(string text)
+    {
+        if (RecordStatusText != null)
+        {
+            RecordStatusText.text = text;
+        }
+    }
+
+    private void EnsureRecordStatusText()
+    {
+        if (RecordStatusText != null || RecordBtn == null)
+        {
+            return;
+        }
+
+        Transform buttons = RecordBtn.transform.parent;
+        Transform panel = buttons != null ? buttons.parent : null;
+        if (panel == null)
+        {
+            return;
+        }
+
+        GameObject statusObject = new GameObject("RecordStatus", typeof(RectTransform));
+        statusObject.transform.SetParent(panel, false);
+        LayoutElement layout = statusObject.AddComponent<LayoutElement>();
+        layout.ignoreLayout = true;
+
+        Text text = statusObject.AddComponent<Text>();
+        text.font = CameraStatusText != null && CameraStatusText.font != null
+            ? CameraStatusText.font
+            : Resources.GetBuiltinResource<Font>("Arial.ttf");
+        text.fontSize = 14;
+        text.color = Color.white;
+        text.alignment = TextAnchor.MiddleRight;
+        text.horizontalOverflow = HorizontalWrapMode.Overflow;
+        text.verticalOverflow = VerticalWrapMode.Overflow;
+        text.raycastTarget = false;
+
+        RectTransform rect = statusObject.GetComponent<RectTransform>();
+        rect.anchorMin = new Vector2(1f, 1f);
+        rect.anchorMax = new Vector2(1f, 1f);
+        rect.pivot = new Vector2(1f, 1f);
+        rect.anchoredPosition = new Vector2(-8f, -6f);
+        rect.sizeDelta = new Vector2(150f, 20f);
+        RecordStatusText = text;
     }
 
 
@@ -264,13 +328,18 @@ public partial class UICameraCtrl : MonoBehaviour
         {
             _session.RequestStop("object destroyed");
         }
+
+        if (_apiSession.IsActive)
+        {
+            _apiSession.RequestStop("object destroyed");
+        }
     }
 
     private void OnRecordBtn(bool on)
     {
         if (on)
         {
-            if (_session.IsActive)
+            if (_session.IsActive || _apiSession.IsActive)
             {
                 return;
             }
@@ -294,37 +363,34 @@ public partial class UICameraCtrl : MonoBehaviour
         // Vision data
         if (visionToggle.isOn)
         {
-            if (trackingToggle.isOn)
+            bool withTracking = trackingToggle.isOn;
+            RecordDialog.Show(() =>
             {
-                // Start together
-                RecordDialog.Show(() =>
-                {
-                    StartRecord(RecordDialog.ResolutionWidth, RecordDialog.ResolutionHeight,
-                        RecordDialog.Fps, RecordDialog.Bitrate, true);
-                }, null);
-            }
-            else
-            {
-                // Vision data only
-                RecordDialog.Show(() =>
-                {
-                    StartRecord(RecordDialog.ResolutionWidth, RecordDialog.ResolutionHeight,
-                        RecordDialog.Fps, RecordDialog.Bitrate, false);
-                }, null);
-            }
+                StartRecord(RecordDialog.ResolutionWidth, RecordDialog.ResolutionHeight,
+                    RecordDialog.Fps, RecordDialog.Bitrate, withTracking, RecordDialog.ExpImage);
+            }, null);
         }
         else
         {
             if (trackingToggle.isOn)
             {
+                _useApiCapture = false;
                 _session.Begin(this, 2160, 810, 30, 0, false, true);
             }
         }
     }
 
     private void StartRecord(int width, int height, int fps, int bitrate,
-        bool onTrackingData)
+        bool onTrackingData, int expImage = 0)
     {
+        _useApiCapture = expImage == 1;
+        if (_useApiCapture)
+        {
+            // Width/Height stay in the dialog for path A only. Path B uses the for4U buffer size.
+            _apiSession.Begin(this, fps, onTrackingData);
+            return;
+        }
+
         _session.Begin(this, width, height, fps, bitrate, true, onTrackingData);
     }
 
@@ -356,6 +422,12 @@ public partial class UICameraCtrl : MonoBehaviour
 
     private void StopRecord()
     {
+        if (_apiSession.IsActive)
+        {
+            _apiSession.RequestStop("user");
+            return;
+        }
+
         _session.RequestStop("user");
     }
 
@@ -375,6 +447,17 @@ public partial class UICameraCtrl : MonoBehaviour
 
     private void Update()
     {
+        if (_useApiCapture || _apiSession.IsActive)
+        {
+            _apiSession.Pump();
+            if (_apiSession.TrackingWriteEnabled)
+            {
+                _apiSession.WriteTrackingSample();
+            }
+
+            return;
+        }
+
         _session.Pump();
         if (_recordTrackingData)
         {
@@ -384,7 +467,17 @@ public partial class UICameraCtrl : MonoBehaviour
 
     private void OnApplicationPause(bool pauseStatus)
     {
-        if (pauseStatus && _session.IsActive)
+        if (!pauseStatus)
+        {
+            return;
+        }
+
+        if (_apiSession.IsActive)
+        {
+            _apiSession.RequestStop("application paused");
+        }
+
+        if (_session.IsActive)
         {
             _session.RequestStop("application paused");
         }

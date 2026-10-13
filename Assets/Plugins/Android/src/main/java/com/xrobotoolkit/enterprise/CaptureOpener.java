@@ -59,6 +59,35 @@ public final class CaptureOpener {
         }
     }
 
+    /**
+     * CameraHandle.SetConfig always calls enableEIS(true) before configure.
+     * Electronic stabilization keeps a margin and crops the recorded frame.
+     * Call this after SetConfig so the MP4 keeps the capture size's full field.
+     * Native enableEIS returns 1 on the success log path.
+     */
+    public static int disableElectronicStabilization(CameraHandle cameraHandle) {
+        try {
+            if (cameraHandle == null) {
+                return -2;
+            }
+
+            Field cameraField = CameraHandle.class.getDeclaredField("mPXRCamera");
+            cameraField.setAccessible(true);
+            Object cameraObject = cameraField.get(cameraHandle);
+            if (!(cameraObject instanceof PXRCamera)) {
+                Log.e(TAG, "disableElectronicStabilization missing PXRCamera");
+                return -2;
+            }
+
+            int result = ((PXRCamera) cameraObject).enableEIS(false);
+            Log.i(TAG, "enableEIS(false) result=" + result + " (native success is 1)");
+            return result;
+        } catch (Throwable error) {
+            Log.e(TAG, "disableElectronicStabilization failed", error);
+            return -3;
+        }
+    }
+
     public static boolean markUseStateIdle(CameraHandle cameraHandle) {
         try {
             if (cameraHandle == null) {
