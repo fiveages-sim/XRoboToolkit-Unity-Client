@@ -43,6 +43,13 @@ namespace Robot
 
         public static void WriteApiMp4Plan(JsonData meta, int width, int height, int fps, string cameraMode)
         {
+            // Legacy api-mp4 plan; exp_Image=1 now uses WriteApiFramesPlan.
+            WriteApiFramesPlan(meta, width, height, fps, cameraMode, "", "", 80);
+        }
+
+        public static void WriteApiFramesPlan(JsonData meta, int width, int height, int fps, string cameraMode,
+            string framesDir, string framesJsonlPath, int jpegQuality)
+        {
             JsonData modes = new JsonData();
             modes["selected"] = cameraMode ?? "LEFT";
             modes["available"] = "LEFT, RIGHT, 3D, Interlace";
@@ -52,9 +59,59 @@ namespace Robot
             meta["configuredFps"] = fps;
             meta["picoApiFrame"] = UnavailableFrame(
                 "Waiting for the first for4U Frame callback to fill width, height, datasize, and pixel format.");
-            WriteApiPreEncode(meta, width, height, cameraMode);
+            JsonData pre = new JsonData();
+            pre["width"] = width;
+            pre["height"] = height;
+            pre["crop"] = "none";
+            pre["rotationDegrees"] = 0;
+            pre["scale"] = "1:1 RGBA → JPEG on headset; MP4 is encoded on PC";
+            pre["jpegQuality"] = jpegQuality;
+            pre["framesDir"] = framesDir ?? "";
+            pre["framesJsonlPath"] = framesJsonlPath ?? "";
+            if (string.Equals(cameraMode, "3D", StringComparison.OrdinalIgnoreCase))
+            {
+                pre["layout"] = "3D side-by-side in one buffer, left half then right half";
+            }
+            else if (string.Equals(cameraMode, "RIGHT", StringComparison.OrdinalIgnoreCase))
+            {
+                pre["layout"] = "RIGHT, single eye, full buffer";
+            }
+            else
+            {
+                pre["layout"] = "LEFT, single eye, full buffer";
+            }
+
+            meta["preEncode"] = pre;
             meta["calibration"] = CalibrationNote(width, height, false);
             meta["timeSync"] = ApiTimeSync(0, 0, false);
+        }
+
+        public static void WriteApiFramesResult(JsonData meta, string framesDir, string framesJsonlPath,
+            int savedFrames, int requestedFps, float savedFps, int throttledDrops, int jpegQuality)
+        {
+            JsonData frames = new JsonData();
+            frames["dir"] = framesDir ?? "";
+            frames["jsonl"] = framesJsonlPath ?? "";
+            frames["savedFrames"] = savedFrames;
+            frames["requested_fps"] = requestedFps;
+            frames["saved_fps"] = savedFps.ToString("R", CultureInfo.InvariantCulture);
+            frames["jpegQuality"] = jpegQuality;
+            frames["throttledDrops"] = throttledDrops;
+            frames["throttlePolicy"] =
+                "Callbacks above requested_fps or while the JPEG writer is busy are dropped. " +
+                "Latest-frame slot only; PC builds CameraRecord_*.mp4 from frames_*/ and jsonl.";
+            frames["pcEncode"] = "Docs/for4u_frames_to_mp4.sh";
+            bool dirOk = !string.IsNullOrEmpty(framesDir) && Directory.Exists(framesDir);
+            bool jsonlOk = !string.IsNullOrEmpty(framesJsonlPath) && File.Exists(framesJsonlPath);
+            frames["dirPresent"] = dirOk;
+            frames["jsonlPresent"] = jsonlOk;
+            meta["frames"] = frames;
+            // No headset mp4 for api-frames sessions.
+            JsonData mp4 = new JsonData();
+            mp4["present"] = false;
+            mp4["path"] = "";
+            mp4["note"] = "Headset does not write MP4 for saveType=api-frames. Encode on PC.";
+            meta["mp4"] = mp4;
         }
 
         public static void WriteApiFrameFacts(JsonData meta, int width, int height, string pixelFormat,

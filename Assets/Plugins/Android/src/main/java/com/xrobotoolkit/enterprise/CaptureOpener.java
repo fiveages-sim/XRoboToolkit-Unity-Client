@@ -22,6 +22,17 @@ public final class CaptureOpener {
     private static final String TAG = "CaptureOpener";
     public static final int NOT_CALLED = Integer.MIN_VALUE;
 
+    static {
+        // Vision PXRCamera JNI lives in a renamed .so so it can coexist with
+        // capturelib-release's libpvrcapturelib.so (PXRCapture / for4U).
+        try {
+            System.loadLibrary("pvrcamera07lib");
+            Log.i(TAG, "loaded libpvrcamera07lib for PXRCamera JNI");
+        } catch (Throwable error) {
+            Log.e(TAG, "failed to load libpvrcamera07lib", error);
+        }
+    }
+
     private CaptureOpener() {
     }
 

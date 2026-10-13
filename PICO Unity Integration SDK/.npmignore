@@ -1,0 +1,4 @@
+CameraCapture/
+.cursor/
+**/*.plan.md
+PulledData/

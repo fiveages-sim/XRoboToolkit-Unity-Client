@@ -246,9 +246,37 @@ namespace Robot
         }
 
         private static AndroidJavaObject _javaObj = null;
+        private static bool _visionNativeReady;
+
+        /// <summary>
+        /// Loads libpvrcamera07lib before PXRCamera is first touched. PXRCamera still
+        /// System.loadLibrary("pvrcapturelib") for the release .so; ART then resolves
+        /// PXRCamera_* JNI from the already-loaded Vision .so.
+        /// </summary>
+        private static void EnsureVisionNativeLoaded()
+        {
+            if (_visionNativeReady)
+            {
+                return;
+            }
+
+            try
+            {
+                using (new AndroidJavaClass("com.xrobotoolkit.enterprise.CaptureOpener"))
+                {
+                }
+
+                _visionNativeReady = true;
+            }
+            catch (Exception exception)
+            {
+                Debug.LogError("[PXRCapture] CaptureOpener preload failed: " + exception.Message);
+            }
+        }
 
         private static AndroidJavaObject GetJavaObject()
         {
+            EnsureVisionNativeLoaded();
             if (_javaObj == null)
             {
                 _javaObj = new AndroidJavaObject("com.picovr.robotassistantlib.CameraHandle");
@@ -290,6 +318,7 @@ namespace Robot
 
             try
             {
+                EnsureVisionNativeLoaded();
                 using (AndroidJavaClass opener = new AndroidJavaClass("com.xrobotoolkit.enterprise.CaptureOpener"))
                 {
                     int[] results = opener.CallStatic<int[]>("openWithCallbackFirst", GetJavaObject(), _callbackProxy);
@@ -413,11 +442,13 @@ namespace Robot
             }
         }
 
+        /// <summary>
+        /// L3 diagnostic pipeline log (logcat only). User-facing failures use LogWindow directly.
+        /// </summary>
         private static void LogPipeline(string eventName, string detail)
         {
             string message = "session=" + _logContext + " event=" + eventName + " " + detail;
             Debug.Log("[PXRCapture] " + message);
-            LogWindow.Info(message);
         }
     }
 }

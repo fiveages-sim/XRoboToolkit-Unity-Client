@@ -36,6 +36,12 @@ android {
         noCompress = **BUILTIN_NOCOMPRESS** + unityStreamingAssets.tokenize(', ')
         ignoreAssetsPattern = "!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~"
     }**PACKAGING_OPTIONS**
+
+    // Vision (PXRCamera) + for4U (PXRCapture) both need capturelib; only release ships libpvrcapturelib.so.
+    // pickFirst keeps the build safe if a second copy reappears in dependencies.
+    packagingOptions {
+        pickFirst '**/libpvrcapturelib.so'
+    }
 }**REPOSITORIES**
 **IL_CPP_BUILD_SETUP**
 **SOURCE_BUILD_SETUP**

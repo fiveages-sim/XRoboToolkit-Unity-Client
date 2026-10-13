@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System.Text;
 using Network;
 using Unity.XR.PXR;
@@ -8,8 +9,6 @@ namespace Robot
     public class ExtDevTracking : MonoBehaviour
     {
         private bool _enable = false;
-        private int _realLength = 0;
-        private ExtDevTrackerPassDataArray _passDataArray = new ExtDevTrackerPassDataArray();
 
         public void Start()
         {
@@ -18,7 +17,7 @@ namespace Robot
 
         private void OnEnable()
         {
-            // 启动独立外设透传数据接口的控制接口
+            // Enable expand-device custom data APIs (same capability gate as old pass-data state).
             PXR_MotionTracking.SetExtDevTrackerPassDataState(true);
         }
 
@@ -29,14 +28,22 @@ namespace Robot
 
         public void Update()
         {
-            if (_enable)
+            if (!_enable)
             {
-                int result = PXR_MotionTracking.GetExtDevTrackerByPassData(ref _passDataArray, ref _realLength);
-                for (int i = 0; i < _realLength; i++)
-                {
-                    ExtDevTrackerPassData passData = _passDataArray.passDatas[i];
-                    PackageSend(passData);
-                }
+                return;
+            }
+
+            // SDK 3.4.0: GetExtDevTrackerByPassData is obsolete(error).
+            List<ExpandDevicesCustomData> dataArray;
+            int result = PXR_MotionTracking.GetExpandDeviceCustomData(out dataArray);
+            if (result != 0 || dataArray == null)
+            {
+                return;
+            }
+
+            for (int i = 0; i < dataArray.Count; i++)
+            {
+                PackageSend(dataArray[i]);
             }
         }
 
@@ -66,30 +73,24 @@ namespace Robot
             TcpHandler.SendCustomData(package);
         }
 
-        private void PackageSend(ExtDevTrackerPassData passData)
+        private void PackageSend(ExpandDevicesCustomData passData)
         {
-            byte[] package = PackageHandle.CustomPacket(CustomDataType.TRACKER_EXTRA_DEVICE, passData.trackerSN.value,
-                passData.passData);
+            byte[] payload = passData.data ?? System.Array.Empty<byte>();
+            byte[] package = PackageHandle.CustomPacket(CustomDataType.TRACKER_EXTRA_DEVICE,
+                passData.deviceId.ToString(), payload);
             TcpHandler.SendCustomData(package);
         }
 
         public void OnDestroy()
         {
             PXR_MotionTracking.ExtDevPassDataAction -= ExtDevPassDataAction;
-            // 关闭独立外设透传数据接口的控制接口
             PXR_MotionTracking.SetExtDevTrackerPassDataState(false);
         }
 
         private void ExtDevPassDataAction(int value)
         {
-            if (value == 1) // 监听此事件，为 1 时，开始调用 GetExtDevTrackerByPassData
-            {
-                _enable = true;
-            }
-            else if (value == 0) // 监听此事件，为 0 时，停止调用 GetExtDevTrackerByPassData
-            {
-                _enable = false;
-            }
+            // 1 = start polling custom data; 0 = stop.
+            _enable = value == 1;
         }
     }
 }

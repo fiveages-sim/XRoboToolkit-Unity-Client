@@ -1,0 +1,19 @@
+{
+    "name": "PICO.CameraCollection",
+    "rootNamespace": "Pico.CameraCapture",
+    "references": [
+        "PICO.TobSupport",
+        "Unity.XR.PICO",
+        "Unity.UGUI",
+        "Unity.XR.Interaction.Toolkit"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": true,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

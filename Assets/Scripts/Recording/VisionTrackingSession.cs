@@ -1,5 +1,6 @@
 using System;
 using System.Collections;
+using System.Globalization;
 using System.IO;
 using System.Text;
 using LitJson;
@@ -506,7 +507,6 @@ namespace Robot
             _meta["trackingStartElapsedRealtimeNs"] = elapsed;
             _meta["trackingStartPredictTimeUs"] = predictUs;
             LogEvent("TrackingWriterOpened", "path=" + _trackingPath, false);
-            LogWindow.Warn("Tracking file path: " + _trackingPath);
         }
 
         private void ConfirmRecording(string source)
@@ -528,7 +528,18 @@ namespace Robot
             SetVisual("recording");
             SetStatus("Recording");
             LogEvent("RecordingConfirmed", "source=" + source + " mode=" + ModeName(), false);
-            LogWindow.Info("Recording confirmed session=" + SessionId);
+            string startLine = "Recording started session=" + SessionId;
+            if (_vision && !string.IsNullOrEmpty(_videoPath))
+            {
+                startLine += " video=" + _videoPath;
+            }
+
+            if (_tracking && !string.IsNullOrEmpty(_trackingPath))
+            {
+                startLine += " tracking=" + _trackingPath;
+            }
+
+            LogWindow.Info(startLine);
             Toast.Show("Recording started");
             if (_tracking)
             {
@@ -660,11 +671,24 @@ namespace Robot
 
             string summary = "status=" + _meta["status"] + " reason=" + reason +
                              (string.IsNullOrEmpty(validationError) ? "" : " validation=" + validationError);
+            long videoBytes = FileLength(_videoPath);
+            long trackingBytes = FileLength(_trackingPath);
             if (finalPhase == RecordingSessionPhase.Completed)
             {
                 LogEvent("SessionCompleted", summary, false);
-                LogWindow.Info("Session completed " + SessionId);
-                Toast.Show("Session completed");
+                string saved = "Saved session=" + SessionId;
+                if (_vision)
+                {
+                    saved += " video=" + _videoPath + " bytes=" + videoBytes;
+                }
+
+                if (_tracking)
+                {
+                    saved += " tracking=" + _trackingPath + " bytes=" + trackingBytes;
+                }
+
+                LogWindow.Info(saved);
+                Toast.Show("Saved " + FormatBytes(videoBytes > 0 ? videoBytes : trackingBytes));
             }
             else
             {
@@ -924,18 +948,33 @@ namespace Robot
 
         private void LogEvent(string eventName, string detail, bool error)
         {
+            // L3 diagnostics go to logcat; L1/L2 user lines are written explicitly via LogWindow.
             string message = "session=" + SessionId + " event=" + eventName + " t=" + DateTime.UtcNow.ToString("o") +
                              " " + detail;
             if (error)
             {
                 Debug.LogError("[RecordSession] " + message);
-                LogWindow.Error(message);
+                LogWindow.Error("session=" + SessionId + " " + eventName + " " + detail);
             }
             else
             {
                 Debug.Log("[RecordSession] " + message);
-                LogWindow.Info(message);
             }
+        }
+
+        private static string FormatBytes(long bytes)
+        {
+            if (bytes < 1024)
+            {
+                return bytes + " B";
+            }
+
+            if (bytes < 1024 * 1024)
+            {
+                return (bytes / 1024.0).ToString("0.0", CultureInfo.InvariantCulture) + " KB";
+            }
+
+            return (bytes / (1024.0 * 1024.0)).ToString("0.00", CultureInfo.InvariantCulture) + " MB";
         }
 
         private void SetVisual(string phase)

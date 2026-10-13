@@ -3,7 +3,7 @@
     "m_SelectedProcess": {
         "deviceId": "PA9410MGL7110037G",
         "name": "com.xrobotoolkit.client",
-        "processId": 32452,
+        "processId": 20619,
         "exited": false
     },
     "m_SelectedPriority": 0,
@@ -11,19 +11,43 @@
         {
             "deviceId": "PA9410MGL7110037G",
             "name": "com.xrobotoolkit.client",
-            "processId": 21636,
+            "processId": 6732,
+            "exited": true
+        },
+        {
+            "deviceId": "PA9410MGL7110037G",
+            "name": "com.xrobotoolkit.client",
+            "processId": 12004,
+            "exited": true
+        },
+        {
+            "deviceId": "PA9410MGL7110037G",
+            "name": "com.xrobotoolkit.client",
+            "processId": 12820,
+            "exited": true
+        },
+        {
+            "deviceId": "PA9410MGL7110037G",
+            "name": "com.xrobotoolkit.client",
+            "processId": 15484,
+            "exited": true
+        },
+        {
+            "deviceId": "PA9410MGL7110037G",
+            "name": "com.xrobotoolkit.client",
+            "processId": 16380,
             "exited": false
         },
         {
             "deviceId": "PA9410MGL7110037G",
             "name": "com.xrobotoolkit.client",
-            "processId": 30663,
+            "processId": 18805,
             "exited": false
         },
         {
             "deviceId": "PA9410MGL7110037G",
             "name": "com.xrobotoolkit.client",
-            "processId": 32452,
+            "processId": 20619,
             "exited": false
         }
     ],

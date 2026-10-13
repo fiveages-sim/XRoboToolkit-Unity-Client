@@ -1,8 +1,10 @@
 using System;
 using System.Collections;
+using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 using LitJson;
 using Unity.XR.PICO.TOBSupport;
@@ -12,9 +14,8 @@ using UnityEngine.Android;
 namespace Robot
 {
     /// <summary>
-    /// Experimental for4U frame capture that encodes CameraRecord_&lt;session&gt;.mp4.
-    /// Capture callbacks only keep the latest frame; RGBA→MP4 runs on a worker thread so
-    /// the XR UI thread can still accept Record stop.
+    /// for4U capture that stores JPEG frames at the dialog FPS plus tracking/meta.
+    /// PC encodes CameraRecord_*.mp4 offline. No headset MediaCodec / FrameMuxer.
     /// </summary>
     public class ApiFrameSession
     {
@@ -22,71 +23,79 @@ namespace Robot
         public const int BufferHeight = 1536;
         public const string CapturePathId = "professional-api-for4U";
         public const string LockedCameraMode = "3D";
+        public const int JpegQuality = 80;
+        private const float WriterJoinSeconds = 20f;
 
         private readonly object _frameLock = new object();
-        private readonly object _muxerLock = new object();
 
         private UICameraCtrl _host;
         private TrackingData _trackingData = new TrackingData();
         private JsonData _trackingJson = new JsonData();
         private JsonData _meta;
         private StreamWriter _trackingWriter;
+        private StreamWriter _framesJsonlWriter;
         private Coroutine _routine;
-        private AndroidJavaObject _muxer;
+        private Coroutine _finishRoutine;
         private byte[] _pinned;
         private GCHandle _handle;
         private byte[] _pending;
-        private byte[] _encodeBuffer;
+        private sbyte[] _writeBuffer;
         private int _pendingLength;
         private uint _pendingDataSize;
         private ulong _pendingTimestamp;
         private int _pendingWidth;
         private int _pendingHeight;
         private bool _pendingReady;
-        private int _encodeLength;
-        private long _encodePtsUs;
-        private long _encodeSdkNs;
-        private bool _encodeBusy;
+        private int _writeLength;
+        private long _writeSdkNs;
+        private long _writeElapsedNs;
+        private int _writeWidth;
+        private int _writeHeight;
+        private bool _writeBusy;
         private bool _acceptFrames;
         private bool _finalized;
         private bool _stopRequested;
+        private bool _finishStarted;
         private string _pendingStopReason;
+        private string _pendingFail;
         private bool _cameraOpen;
-        private bool _muxerStarted;
         private bool _modeStarted;
         private bool _tracking;
         private int _requestedFps;
         private string _cameraMode = LockedCameraMode;
-        private int _encodedFrames;
+        private int _savedFrames;
         private int _callbacks;
         private int _droppedFrames;
         private int _throttledDrops;
+        private int _dropsSinceLastSave;
         private int _trackingSamples;
-        private string _pendingFail;
         private string _sessionId = "";
-        private string _videoPath = "";
         private string _metaPath = "";
         private string _trackingPath = "";
+        private string _framesDir = "";
+        private string _framesJsonlPath = "";
         private string _pixelFormat = "not-read";
         private int _actualWidth;
         private int _actualHeight;
         private uint _actualDataSize;
         private long _firstSdkNs;
         private long _firstElapsedNs;
-        private long _lastQueuedSdkNs;
-        private long _encodeIntervalNs;
+        private long _lastAcceptedSdkNs;
+        private long _sampleIntervalNs;
         private bool _haveFrame;
         private float _callbackWindow;
         private int _callbacksAtWindow;
         private float _sourceFps;
-        private float _encodedFpsWindow;
-        private int _encodedAtWindow;
-        private float _encodedFps;
-        private Thread _encodeThread;
-        private AutoResetEvent _encodeSignal;
-        private volatile bool _encodeThreadRun;
-        private bool _finishStarted;
-        private Coroutine _finishRoutine;
+        private float _savedFpsWindow;
+        private int _savedAtWindow;
+        private float _savedFps;
+        private Thread _writerThread;
+        private AutoResetEvent _writerSignal;
+        private volatile bool _writerThreadRun;
+        private bool _outputCameraRawData;
+        private bool _enableEis;
+        private bool _enableMctf;
+        private bool _enableMfnr;
         private RecordingSessionPhase _phase = RecordingSessionPhase.Idle;
 
         public bool IsActive
@@ -107,7 +116,9 @@ namespace Robot
             get { return _sessionId; }
         }
 
-        public void Begin(UICameraCtrl host, int requestedFps, bool tracking)
+        public void Begin(UICameraCtrl host, int requestedFps, bool tracking,
+            bool outputCameraRawData = false, bool enableEis = false, bool enableMctf = false,
+            bool enableMfnr = true)
         {
             if (IsActive || host == null)
             {
@@ -116,51 +127,56 @@ namespace Robot
 
             _host = host;
             _tracking = tracking;
+            _outputCameraRawData = outputCameraRawData;
+            _enableEis = enableEis;
+            _enableMctf = enableMctf;
+            _enableMfnr = enableMfnr;
             _requestedFps = Mathf.Clamp(requestedFps, 1, 60);
-            _encodeIntervalNs = (long)(1e9 / Math.Max(1, _requestedFps));
+            _sampleIntervalNs = (long)(1e9 / Math.Max(1, _requestedFps));
             _cameraMode = LockedCameraMode;
             _finalized = false;
             _finishStarted = false;
             _finishRoutine = null;
             _stopRequested = false;
             _pendingStopReason = null;
+            _pendingFail = null;
             _cameraOpen = false;
-            _muxerStarted = false;
             _modeStarted = false;
             _haveFrame = false;
-            _encodeBusy = false;
+            _writeBusy = false;
             _pendingReady = false;
-            _encodedFrames = 0;
+            _savedFrames = 0;
             _callbacks = 0;
             _droppedFrames = 0;
             _throttledDrops = 0;
+            _dropsSinceLastSave = 0;
             _trackingSamples = 0;
-            _pendingFail = null;
             _acceptFrames = false;
-            _lastQueuedSdkNs = 0;
+            _lastAcceptedSdkNs = 0;
             _sourceFps = 0f;
-            _encodedFps = 0f;
-            _encodedFpsWindow = 0f;
-            _encodedAtWindow = 0;
+            _savedFps = 0f;
+            _savedFpsWindow = 0f;
+            _savedAtWindow = 0;
             TrackingWriteEnabled = false;
             _sessionId = DateTime.Now.ToString("yyyyMMdd_HHmmss");
             string download = VisionTrackingSession.DownloadDir;
             if (File.Exists(Path.Combine(download, "recording_meta_" + _sessionId + ".json")) ||
                 File.Exists(Path.Combine(download, "trackingData_" + _sessionId + ".txt")) ||
-                File.Exists(Path.Combine(download, "CameraRecord_" + _sessionId + ".mp4")))
+                Directory.Exists(Path.Combine(download, "frames_" + _sessionId)))
             {
                 _sessionId = _sessionId + "_" + DateTime.Now.ToString("fff");
             }
 
-            _videoPath = Path.Combine(download, "CameraRecord_" + _sessionId + ".mp4");
             _metaPath = Path.Combine(download, "recording_meta_" + _sessionId + ".json");
+            _framesDir = Path.Combine(download, "frames_" + _sessionId);
+            _framesJsonlPath = Path.Combine(download, "frames_" + _sessionId + ".jsonl");
             _phase = RecordingSessionPhase.Starting;
             _meta = new JsonData();
             _meta["sessionId"] = _sessionId;
             _meta["mode"] = tracking ? "vision+tracking" : "vision";
             _meta["imageCapturePath"] = CapturePathId;
             _meta["exp_Image"] = 1;
-            _meta["saveType"] = "api-mp4";
+            _meta["saveType"] = "api-frames";
             _meta["experimental"] = true;
             _meta["captureApi"] = "for4U-SetCameraFrameBuffer";
             _meta["status"] = "starting";
@@ -171,25 +187,44 @@ namespace Robot
             _meta["dialogHeightIgnored"] = true;
             _meta["requested_fps"] = _requestedFps;
             _meta["configuredFps"] = _requestedFps;
+            _meta["jpegQuality"] = JpegQuality;
             _meta["cameraMode"] = _cameraMode;
             _meta["cameraModeLocked"] = true;
-            _meta["videoPath"] = _videoPath;
-            _meta["encodeThread"] = true;
+            _meta["framesDir"] = _framesDir;
+            _meta["framesJsonlPath"] = _framesJsonlPath;
+            _meta["pcEncodeNote"] =
+                "Headset stores JPEG frames at requested_fps. Run Docs/for4u_frames_to_mp4.sh to build CameraRecord_<sessionId>.mp4 on PC.";
             _meta["fovNote"] =
                 "Professional API mode uses the for4U buffer " + BufferWidth + "x" + BufferHeight +
                 " and PXRCapture_RenderMode_3D side-by-side. RecordDialog Width/Height are not applied as crop or scale.";
             _meta["sdkLimits"] =
-                "This SDK exposes Configurefor4U(bool,int) and OpenCameraAsyncfor4U(Action). " +
-                "It has no dictionary overload for KEY_EIS or KEY_OUTPUT_CAMERA_RAW_DATA.";
-            CaptureReport.WriteApiMp4Plan(_meta, BufferWidth, BufferHeight, _requestedFps, _cameraMode);
+                "SDK 3.4.0 for4U flags come from RecordDialog (Raw exclusive with EIS/MCTF/MFNR). " +
+                "No headset MediaCodec; JPEG writer thread + PC encode.";
+            _meta["outputCameraRawData"] = _outputCameraRawData;
+            _meta["enableEis"] = _enableEis;
+            _meta["enableMctf"] = _enableMctf;
+            _meta["enableMfnr"] = _enableMfnr;
+            _meta["configureKeyOutputCameraRawData"] = _outputCameraRawData
+                ? PXRCapture.VALUE_TRUE
+                : PXRCapture.VALUE_FALSE;
+            _meta["openKeyEis"] = _enableEis ? PXRCapture.VALUE_TRUE : PXRCapture.VALUE_FALSE;
+            _meta["openKeyMctf"] = _enableMctf ? PXRCapture.VALUE_TRUE : PXRCapture.VALUE_FALSE;
+            _meta["openKeyMfnr"] = _enableMfnr ? PXRCapture.VALUE_TRUE : PXRCapture.VALUE_FALSE;
+            CaptureReport.WriteApiFramesPlan(_meta, BufferWidth, BufferHeight, _requestedFps, _cameraMode,
+                _framesDir, _framesJsonlPath, JpegQuality);
             WriteMeta();
             SetVisual("starting");
             SetStatus("API starting");
+            string flags = "exp_Image=1 raw=" + (_outputCameraRawData ? 1 : 0) +
+                           " eis=" + (_enableEis ? 1 : 0) +
+                           " mctf=" + (_enableMctf ? 1 : 0) +
+                           " mfnr=" + (_enableMfnr ? 1 : 0) +
+                           " fps=" + _requestedFps;
+            LogWindow.Info(flags + " buffer=" + BufferWidth + "x" + BufferHeight + " save=api-frames");
             Log("ApiCaptureRequested",
-                "buffer=" + BufferWidth + "x" + BufferHeight + " mode=" + _cameraMode +
-                " requested_fps=" + _requestedFps + " tracking=" + tracking);
+                flags + " mode=" + _cameraMode + " tracking=" + tracking + " saveType=api-frames");
 #if UNITY_ANDROID && !UNITY_EDITOR
-            StartEncodeThread();
+            StartWriterThread();
             _routine = host.StartCoroutine(Run());
 #else
             BeginFinish("for4U frame capture requires the PICO 4 Ultra Enterprise device");
@@ -203,7 +238,6 @@ namespace Robot
                 return;
             }
 
-            // Latch immediately so OnFrame/Pump stop heavy work and the Record button can respond.
             _stopRequested = true;
             _acceptFrames = false;
             TrackingWriteEnabled = false;
@@ -248,12 +282,12 @@ namespace Robot
                     _callbackWindow = 0f;
                 }
 
-                _encodedFpsWindow += Time.unscaledDeltaTime;
-                if (_encodedFpsWindow >= 1f)
+                _savedFpsWindow += Time.unscaledDeltaTime;
+                if (_savedFpsWindow >= 1f)
                 {
-                    _encodedFps = (_encodedFrames - _encodedAtWindow) / _encodedFpsWindow;
-                    _encodedAtWindow = _encodedFrames;
-                    _encodedFpsWindow = 0f;
+                    _savedFps = (_savedFrames - _savedAtWindow) / _savedFpsWindow;
+                    _savedAtWindow = _savedFrames;
+                    _savedFpsWindow = 0f;
                 }
             }
 
@@ -267,10 +301,17 @@ namespace Robot
             ulong timestamp;
             int width;
             int height;
+            int dropsBefore = Interlocked.Exchange(ref _dropsSinceLastSave, 0);
             lock (_frameLock)
             {
-                if (!_pendingReady || _encodeBusy)
+                if (!_pendingReady || _writeBusy)
                 {
+                    // Put drops back so the next saved frame still accounts for them.
+                    if (dropsBefore > 0)
+                    {
+                        Interlocked.Add(ref _dropsSinceLastSave, dropsBefore);
+                    }
+
                     return;
                 }
 
@@ -279,12 +320,12 @@ namespace Robot
                 timestamp = _pendingTimestamp;
                 width = _pendingWidth;
                 height = _pendingHeight;
-                if (_encodeBuffer == null || _encodeBuffer.Length < length)
+                if (_writeBuffer == null || _writeBuffer.Length < length)
                 {
-                    _encodeBuffer = new byte[Math.Max(length, BufferWidth * BufferHeight * 4)];
+                    _writeBuffer = new sbyte[Math.Max(length, BufferWidth * BufferHeight * 4)];
                 }
 
-                Buffer.BlockCopy(_pending, 0, _encodeBuffer, 0, length);
+                Buffer.BlockCopy(_pending, 0, _writeBuffer, 0, length);
                 _pendingReady = false;
             }
 
@@ -304,7 +345,7 @@ namespace Robot
             long elapsed = Utils.GetElapsedRealtimeNs();
             if (_phase == RecordingSessionPhase.Starting)
             {
-                if (!StartMuxer(width, height))
+                if (!PrepareFrameSession())
                 {
                     return;
                 }
@@ -318,32 +359,25 @@ namespace Robot
             }
 
             long sdkNs = unchecked((long)timestamp);
-            long ptsUs = 0;
-            if (_haveFrame)
-            {
-                long deltaNs = sdkNs - _firstSdkNs;
-                if (deltaNs < 0)
-                {
-                    deltaNs = 0;
-                }
-
-                ptsUs = deltaNs / 1000L;
-            }
-
             lock (_frameLock)
             {
-                _encodeLength = length;
-                _encodePtsUs = ptsUs;
-                _encodeSdkNs = sdkNs;
-                _lastQueuedSdkNs = sdkNs;
-                _encodeBusy = true;
+                _writeLength = length;
+                _writeSdkNs = sdkNs;
+                _writeElapsedNs = elapsed;
+                _writeWidth = width;
+                _writeHeight = height;
+                _pendingDropsBeforeWrite = dropsBefore;
+                _writeBusy = true;
+                _lastAcceptedSdkNs = sdkNs;
             }
 
-            if (_encodeSignal != null)
+            if (_writerSignal != null)
             {
-                _encodeSignal.Set();
+                _writerSignal.Set();
             }
         }
+
+        private int _pendingDropsBeforeWrite;
 
         public void WriteTrackingSample()
         {
@@ -384,13 +418,38 @@ namespace Robot
             }
 
             PXR_Enterprise.Configurefor4U(false, _requestedFps);
+            var rawCfg = new Dictionary<string, string>
+            {
+                {
+                    PXRCapture.KEY_OUTPUT_CAMERA_RAW_DATA,
+                    _outputCameraRawData ? PXRCapture.VALUE_TRUE : PXRCapture.VALUE_FALSE
+                }
+            };
+            PXR_Enterprise.Configurefor4U(rawCfg);
+
+            var openParams = new Dictionary<string, string>
+            {
+                {
+                    PXRCapture.KEY_MCTF,
+                    _enableMctf ? PXRCapture.VALUE_TRUE : PXRCapture.VALUE_FALSE
+                },
+                {
+                    PXRCapture.KEY_EIS,
+                    _enableEis ? PXRCapture.VALUE_TRUE : PXRCapture.VALUE_FALSE
+                },
+                {
+                    PXRCapture.KEY_MFNR,
+                    _enableMfnr ? PXRCapture.VALUE_TRUE : PXRCapture.VALUE_FALSE
+                }
+            };
+
             bool openDone = false;
             bool openOk = false;
             PXR_Enterprise.OpenCameraAsyncfor4U(ok =>
             {
                 openOk = ok;
                 openDone = true;
-            });
+            }, openParams);
             float waited = 0f;
             while (!openDone && !_finalized && !_stopRequested && waited < 10f)
             {
@@ -413,7 +472,7 @@ namespace Robot
             int bytes = BufferWidth * BufferHeight * 4;
             _pinned = new byte[bytes];
             _pending = new byte[bytes];
-            _encodeBuffer = new byte[bytes];
+            _writeBuffer = new sbyte[bytes];
             _handle = GCHandle.Alloc(_pinned, GCHandleType.Pinned);
             IntPtr data = _handle.AddrOfPinnedObject();
             PXR_Enterprise.SetCameraFrameBufferfor4U(BufferWidth, BufferHeight, ref data, OnFrame);
@@ -425,7 +484,7 @@ namespace Robot
             if (!started)
             {
                 BeginFinish("StartGetImageDatafor4U returned false for " + _cameraMode + " " +
-                       BufferWidth + "x" + BufferHeight);
+                            BufferWidth + "x" + BufferHeight);
                 yield break;
             }
 
@@ -457,10 +516,11 @@ namespace Robot
             }
 
             long sdkNs = unchecked((long)frame.timestamp);
-            if (_lastQueuedSdkNs > 0 && _encodeIntervalNs > 0 &&
-                sdkNs - _lastQueuedSdkNs < _encodeIntervalNs)
+            if (_lastAcceptedSdkNs > 0 && _sampleIntervalNs > 0 &&
+                sdkNs - _lastAcceptedSdkNs < _sampleIntervalNs)
             {
                 Interlocked.Increment(ref _throttledDrops);
+                Interlocked.Increment(ref _dropsSinceLastSave);
                 return;
             }
 
@@ -478,10 +538,10 @@ namespace Robot
                     return;
                 }
 
-                // Keep only the latest unread frame. Never pile copies onto the main/callback path.
-                if (_pendingReady || _encodeBusy)
+                if (_pendingReady || _writeBusy)
                 {
                     Interlocked.Increment(ref _throttledDrops);
+                    Interlocked.Increment(ref _dropsSinceLastSave);
                     return;
                 }
 
@@ -530,39 +590,39 @@ namespace Robot
         }
 #endif
 
-        private void StartEncodeThread()
+        private void StartWriterThread()
         {
-            RequestEncodeThreadStop();
-            if (_encodeThread != null && _encodeThread.IsAlive)
+            RequestWriterThreadStop();
+            if (_writerThread != null && _writerThread.IsAlive)
             {
                 try
                 {
-                    _encodeThread.Join(500);
+                    _writerThread.Join(500);
                 }
                 catch
                 {
                 }
             }
 
-            DisposeEncodeThreadObjects();
-            _encodeThreadRun = true;
-            _encodeSignal = new AutoResetEvent(false);
-            _encodeThread = new Thread(EncodeLoop)
+            DisposeWriterThreadObjects();
+            _writerThreadRun = true;
+            _writerSignal = new AutoResetEvent(false);
+            _writerThread = new Thread(WriterLoop)
             {
                 IsBackground = true,
-                Name = "ApiFrameEncode"
+                Name = "ApiFrameJpegWriter"
             };
-            _encodeThread.Start();
+            _writerThread.Start();
         }
 
-        private void RequestEncodeThreadStop()
+        private void RequestWriterThreadStop()
         {
-            _encodeThreadRun = false;
-            if (_encodeSignal != null)
+            _writerThreadRun = false;
+            if (_writerSignal != null)
             {
                 try
                 {
-                    _encodeSignal.Set();
+                    _writerSignal.Set();
                 }
                 catch
                 {
@@ -570,137 +630,173 @@ namespace Robot
             }
         }
 
-        private void DisposeEncodeThreadObjects()
+        private void DisposeWriterThreadObjects()
         {
-            _encodeThread = null;
-            if (_encodeSignal != null)
+            _writerThread = null;
+            if (_writerSignal != null)
             {
-                _encodeSignal.Dispose();
-                _encodeSignal = null;
+                _writerSignal.Dispose();
+                _writerSignal = null;
             }
         }
 
-        private void EncodeLoop()
+        private void WriterLoop()
         {
 #if UNITY_ANDROID && !UNITY_EDITOR
             AndroidJNI.AttachCurrentThread();
+            AndroidJavaClass writerClass = null;
+            try
+            {
+                writerClass = new AndroidJavaClass("com.xrobotoolkit.enterprise.FrameJpegWriter");
+            }
+            catch (Exception exception)
+            {
+                _pendingFail = "FrameJpegWriter class missing: " + exception.Message;
+            }
 #endif
             try
             {
-                while (_encodeThreadRun)
+                while (true)
                 {
-                    if (_encodeSignal != null)
+                    if (_writerSignal != null)
                     {
-                        _encodeSignal.WaitOne(50);
+                        _writerSignal.WaitOne(50);
                     }
 
                     int length;
-                    long ptsUs;
-                    byte[] buffer;
+                    long sdkNs;
+                    long elapsedNs;
+                    int width;
+                    int height;
+                    int dropsBefore;
+                    sbyte[] buffer;
+                    bool haveWork;
                     lock (_frameLock)
                     {
-                        if (!_encodeBusy || _encodeBuffer == null || _encodeLength <= 0)
+                        haveWork = _writeBusy && _writeBuffer != null && _writeLength > 0;
+                        if (!haveWork)
                         {
+                            if (!_writerThreadRun)
+                            {
+                                break;
+                            }
+
                             continue;
                         }
 
-                        length = _encodeLength;
-                        ptsUs = _encodePtsUs;
-                        buffer = _encodeBuffer;
+                        length = _writeLength;
+                        sdkNs = _writeSdkNs;
+                        elapsedNs = _writeElapsedNs;
+                        width = _writeWidth;
+                        height = _writeHeight;
+                        dropsBefore = _pendingDropsBeforeWrite;
+                        buffer = _writeBuffer;
                     }
 
-                    // Drop any in-flight frame once stop is latched so the worker can exit
-                    // before muxer.finish() runs on the finalize thread.
-                    if (_stopRequested || !_encodeThreadRun)
-                    {
-                        lock (_frameLock)
-                        {
-                            _encodeBusy = false;
-                        }
-
-                        continue;
-                    }
-
+                    int index = _savedFrames;
+                    string fileName = index.ToString("D6", CultureInfo.InvariantCulture) + ".jpg";
+                    string path = Path.Combine(_framesDir, fileName);
                     int result = -1;
                     try
                     {
-                        lock (_muxerLock)
+#if UNITY_ANDROID && !UNITY_EDITOR
+                        if (writerClass != null && Directory.Exists(_framesDir))
                         {
-                            if (_muxer != null && _muxerStarted && !_finishStarted && !_finalized)
-                            {
-                                result = _muxer.Call<int>("encodeRgba", buffer, length, ptsUs);
-                            }
+                            result = writerClass.CallStatic<int>("writeRgbaJpeg", path, buffer, length,
+                                width, height, JpegQuality);
                         }
+#else
+                        result = -1;
+#endif
                     }
                     catch (Exception exception)
                     {
-                        _pendingFail = "FrameMuxer.encodeRgba exception: " + exception.Message;
+                        _pendingFail = "JPEG write exception: " + exception.Message;
                         result = -3;
+                    }
+
+                    if (result == 0)
+                    {
+                        try
+                        {
+                            AppendFramesJsonl(index, fileName, sdkNs, elapsedNs, width, height, dropsBefore);
+                            _savedFrames = index + 1;
+                        }
+                        catch (Exception exception)
+                        {
+                            _pendingFail = "frames.jsonl write failed: " + exception.Message;
+                            _droppedFrames++;
+                        }
+                    }
+                    else if (result != -1)
+                    {
+                        _droppedFrames++;
+                        if (result <= -3 && _pendingFail == null)
+                        {
+                            _pendingFail = "JPEG write failed result=" + result;
+                        }
                     }
 
                     lock (_frameLock)
                     {
-                        if (result == 0)
-                        {
-                            _encodedFrames++;
-                        }
-                        else if (result != -1)
-                        {
-                            _droppedFrames++;
-                            if (result <= -3 && _pendingFail == null)
-                            {
-                                _pendingFail = "FrameMuxer.encodeRgba failed result=" + result;
-                            }
-                        }
-
-                        _encodeBusy = false;
+                        _writeBusy = false;
                     }
                 }
             }
             finally
             {
 #if UNITY_ANDROID && !UNITY_EDITOR
+                if (writerClass != null)
+                {
+                    writerClass.Dispose();
+                }
+
                 AndroidJNI.DetachCurrentThread();
 #endif
             }
         }
 
-        private bool StartMuxer(int width, int height)
+        private bool PrepareFrameSession()
         {
             try
             {
                 Directory.CreateDirectory(VisionTrackingSession.DownloadDir);
-                if (File.Exists(_videoPath))
+                Directory.CreateDirectory(_framesDir);
+                if (File.Exists(_framesJsonlPath))
                 {
-                    File.Delete(_videoPath);
+                    File.Delete(_framesJsonlPath);
                 }
 
-                lock (_muxerLock)
-                {
-                    _muxer = new AndroidJavaObject("com.xrobotoolkit.enterprise.FrameMuxer");
-                    int bitrate = Math.Max(8 * 1024 * 1024, width * height * 2);
-                    _meta["apiFrameWidth"] = width;
-                    _meta["apiFrameHeight"] = height;
-                    _meta["encodeWidth"] = width;
-                    _meta["encodeHeight"] = height;
-                    int result = _muxer.Call<int>("start", _videoPath, width, height, bitrate, _requestedFps);
-                    _meta["muxerStartResult"] = result;
-                    if (result != 0)
-                    {
-                        _pendingFail = "FrameMuxer.start failed result=" + result;
-                        return false;
-                    }
-
-                    _muxerStarted = true;
-                }
-
+                _framesJsonlWriter = new StreamWriter(_framesJsonlPath, false, Encoding.UTF8);
+                _framesJsonlWriter.AutoFlush = true;
+                _meta["framesDir"] = _framesDir;
+                _meta["framesJsonlPath"] = _framesJsonlPath;
                 return true;
             }
             catch (Exception exception)
             {
-                _pendingFail = "FrameMuxer.start exception: " + exception.Message;
+                _pendingFail = "prepare frames session failed: " + exception.Message;
                 return false;
             }
+        }
+
+        private void AppendFramesJsonl(int index, string fileName, long sdkNs, long elapsedNs,
+            int width, int height, int dropsBefore)
+        {
+            if (_framesJsonlWriter == null)
+            {
+                return;
+            }
+
+            JsonData line = new JsonData();
+            line["index"] = index;
+            line["file"] = fileName;
+            line["sdk_timestamp_ns"] = sdkNs.ToString(CultureInfo.InvariantCulture);
+            line["elapsedRealtimeNs"] = elapsedNs.ToString(CultureInfo.InvariantCulture);
+            line["width"] = width;
+            line["height"] = height;
+            line["dropped_before"] = dropsBefore;
+            _framesJsonlWriter.WriteLine(line.ToJson());
         }
 
         private void NoteFrame(int width, int height, uint dataSize, ulong timestamp)
@@ -733,10 +829,22 @@ namespace Robot
             WriteMeta();
             SetVisual("recording");
             SetStatus("API recording");
-            Toast.Show("API capture started");
+            Toast.Show("API frames started");
             Log("ApiRecordingConfirmed",
                 _pixelFormat + " " + _actualWidth + "x" + _actualHeight + " mode=" + _cameraMode +
-                " requested_fps=" + _requestedFps);
+                " requested_fps=" + _requestedFps + " saveType=api-frames");
+            string startLine = "API frames session=" + _sessionId +
+                               " raw=" + (_outputCameraRawData ? 1 : 0) +
+                               " eis=" + (_enableEis ? 1 : 0) +
+                               " mctf=" + (_enableMctf ? 1 : 0) +
+                               " mfnr=" + (_enableMfnr ? 1 : 0) +
+                               " framesDir=" + _framesDir;
+            if (_tracking && !string.IsNullOrEmpty(_trackingPath))
+            {
+                startLine += " tracking=" + _trackingPath;
+            }
+
+            LogWindow.Info(startLine);
         }
 
         private void OpenTracking(long elapsed)
@@ -754,7 +862,8 @@ namespace Robot
             header["elapsedRealtimeNs"] = elapsed;
             header["predictTime"] = predictUs;
             header["predictTimeUs"] = predictUs;
-            header["videoPath"] = _videoPath;
+            header["framesDir"] = _framesDir;
+            header["framesJsonlPath"] = _framesJsonlPath;
             header["clockNote"] =
                 "API frames use Frame.timestamp BOOTTIME ns. elapsedRealtimeNs is the same clock family. timeStampNs stays UTC.";
             _trackingWriter.WriteLine(header.ToJson());
@@ -783,128 +892,69 @@ namespace Robot
                 _routine = null;
             }
 
-            RequestEncodeThreadStop();
+            RequestWriterThreadStop();
             if (_host != null)
             {
                 _finishRoutine = _host.StartCoroutine(FinishAsync(reason));
             }
             else
             {
-                // No host to pump a coroutine; best-effort blocking path for editor-only failures.
-                CompleteFinishAfterMuxer(reason, int.MinValue, "no-host");
+                CompleteFinish(reason, "no-host");
             }
         }
 
         private IEnumerator FinishAsync(string reason)
         {
-            // Let the UI thread keep rendering while the encode worker exits.
+            // Drain writer fully before closing camera (no parallel CloseCamera).
             float waited = 0f;
-            while (_encodeThread != null && _encodeThread.IsAlive && waited < 1.5f)
+            while (_writerThread != null && _writerThread.IsAlive && waited < WriterJoinSeconds)
             {
                 waited += Time.unscaledDeltaTime;
                 yield return null;
             }
 
-            if (_encodeThread != null && _encodeThread.IsAlive)
+            string flushError = null;
+            if (_writerThread != null && _writerThread.IsAlive)
             {
-                Log("ApiEncodeThread", "exit wait timed out; continuing finalize");
+                flushError = "jpeg writer join timed out after " + WriterJoinSeconds + "s";
+                Log("ApiWriterThread", flushError);
             }
 
-            DisposeEncodeThreadObjects();
+            DisposeWriterThreadObjects();
 
-            int muxerFinish = int.MinValue;
-            string muxerError = null;
-            bool muxerDone = false;
-            Thread finalizeThread = new Thread(() =>
+            if (_framesJsonlWriter != null)
             {
-#if UNITY_ANDROID && !UNITY_EDITOR
-                AndroidJNI.AttachCurrentThread();
-#endif
                 try
                 {
-                    lock (_muxerLock)
-                    {
-                        if (_muxer != null)
-                        {
-                            try
-                            {
-                                if (_muxerStarted)
-                                {
-                                    muxerFinish = _muxer.Call<int>("finish");
-                                }
-                                else
-                                {
-                                    _muxer.Call("release");
-                                    muxerFinish = 0;
-                                }
-                            }
-                            catch (Exception exception)
-                            {
-                                muxerError = exception.Message;
-                            }
-
-                            try
-                            {
-                                _muxer.Dispose();
-                            }
-                            catch
-                            {
-                            }
-
-                            _muxer = null;
-                            _muxerStarted = false;
-                        }
-                        else
-                        {
-                            muxerFinish = 0;
-                        }
-                    }
+                    _framesJsonlWriter.Flush();
+                    _framesJsonlWriter.Close();
                 }
-                finally
+                catch (Exception exception)
                 {
-#if UNITY_ANDROID && !UNITY_EDITOR
-                    AndroidJNI.DetachCurrentThread();
-#endif
-                    muxerDone = true;
+                    flushError = string.IsNullOrEmpty(flushError)
+                        ? exception.Message
+                        : flushError + "; " + exception.Message;
                 }
-            })
-            {
-                IsBackground = true,
-                Name = "ApiFrameFinalize"
-            };
-            finalizeThread.Start();
 
-            waited = 0f;
-            while (!muxerDone && waited < 8f)
-            {
-                waited += Time.unscaledDeltaTime;
-                yield return null;
+                _framesJsonlWriter = null;
             }
 
-            if (!muxerDone)
+            if (_trackingWriter != null)
             {
-                muxerError = string.IsNullOrEmpty(muxerError) ? "muxer finish timeout" : muxerError;
-                Log("ApiMuxerFinish", "timeout waiting for background finalize");
+                try
+                {
+                    _trackingWriter.Flush();
+                    _trackingWriter.Close();
+                }
+                catch (Exception exception)
+                {
+                    flushError = string.IsNullOrEmpty(flushError)
+                        ? exception.Message
+                        : flushError + "; " + exception.Message;
+                }
+
+                _trackingWriter = null;
             }
-
-            CompleteFinishAfterMuxer(reason, muxerFinish, muxerError);
-            _finishRoutine = null;
-        }
-
-        private void CompleteFinishAfterMuxer(string reason, int muxerFinish, string muxerError)
-        {
-            if (_finalized)
-            {
-                return;
-            }
-
-            _finalized = true;
-            if (!string.IsNullOrEmpty(muxerError))
-            {
-                _meta["muxerFinishError"] = muxerError;
-            }
-
-            _meta["muxerFinishResult"] = muxerFinish;
 
 #if UNITY_ANDROID && !UNITY_EDITOR
             if (_cameraOpen)
@@ -926,97 +976,104 @@ namespace Robot
                 _handle.Free();
             }
 
-            if (_trackingWriter != null)
+            CompleteFinish(reason, flushError);
+            _finishRoutine = null;
+        }
+
+        private void CompleteFinish(string reason, string flushError)
+        {
+            if (_finalized)
             {
-                _trackingWriter.Flush();
-                _trackingWriter.Close();
-                _trackingWriter = null;
+                return;
+            }
+
+            _finalized = true;
+            if (!string.IsNullOrEmpty(flushError))
+            {
+                _meta["flushError"] = flushError;
             }
 
             CaptureReport.WriteApiFrameFacts(_meta, _actualWidth, _actualHeight, _pixelFormat,
                 (int)_actualDataSize, _requestedFps, _sourceFps, _cameraMode, _modeStarted);
-            CaptureReport.WriteApiPreEncode(_meta, _actualWidth, _actualHeight, _cameraMode);
-            JsonData mp4 = new JsonData();
-            mp4["edges"] =
-                "Full for4U buffer encoded without crop, rotate, or scale. RecordDialog Width/Height were not applied. " +
-                "EIS dictionary keys are unavailable in this SDK.";
-            mp4["encodedFrames"] = _encodedFrames;
-            mp4["requested_fps"] = _requestedFps;
-            mp4["source_fps"] = _sourceFps.ToString("R", CultureInfo.InvariantCulture);
-            mp4["encoded_fps"] = _encodedFps.ToString("R", CultureInfo.InvariantCulture);
-            mp4["throttlePolicy"] =
-                "Callbacks above requested_fps or while encode is busy are dropped before copying. " +
-                "Encoding and muxer finish run off the Unity main thread. Frames are never duplicated.";
-            mp4["throttledDrops"] = _throttledDrops;
-            _meta["mp4"] = mp4;
-            CaptureReport.WriteMp4Result(_meta, _videoPath);
+            CaptureReport.WriteApiFramesResult(_meta, _framesDir, _framesJsonlPath, _savedFrames,
+                _requestedFps, _savedFps, _throttledDrops, JpegQuality);
 
+            // Never query calib while closing; camera already closed above.
             _meta["calibration"] = CaptureReport.CalibrationNote(
                 _actualWidth > 0 ? _actualWidth : BufferWidth,
                 _actualHeight > 0 ? _actualHeight : BufferHeight,
-                true);
+                false);
             _meta["timeSync"] = CaptureReport.ApiTimeSync(_firstSdkNs, _firstElapsedNs, _haveFrame);
 
-            string validation = Validate();
+            string validation = Validate(flushError);
             bool ok = string.IsNullOrEmpty(validation);
-            _meta["status"] = ok ? "completed" : "failed";
+            bool partial = !ok && _savedFrames > 0;
+            _meta["status"] = ok ? "completed" : (partial ? "failed_partial" : "failed");
             _meta["reason"] = reason ?? "";
             _meta["validationError"] = validation ?? "";
             _meta["completedUtc"] = DateTime.UtcNow.ToString("o");
-            _meta["encodedFrames"] = _encodedFrames;
+            _meta["savedFrames"] = _savedFrames;
+            _meta["encodedFrames"] = _savedFrames;
             _meta["callbacks"] = _callbacks;
             _meta["framesDropped"] = _droppedFrames;
             _meta["throttledDrops"] = _throttledDrops;
             _meta["trackingSamples"] = _trackingSamples;
             _meta["requested_fps"] = _requestedFps;
             _meta["source_fps"] = _sourceFps.ToString("R", CultureInfo.InvariantCulture);
-            _meta["encoded_fps"] = _encodedFps.ToString("R", CultureInfo.InvariantCulture);
+            _meta["saved_fps"] = _savedFps.ToString("R", CultureInfo.InvariantCulture);
             _meta["measuredFps"] = _sourceFps.ToString("R", CultureInfo.InvariantCulture);
-            _meta["videoBytes"] = File.Exists(_videoPath) ? new FileInfo(_videoPath).Length : 0;
+            long framesBytes = DirBytes(_framesDir);
+            long trackingBytes = File.Exists(_trackingPath) ? new FileInfo(_trackingPath).Length : 0;
+            _meta["framesBytes"] = framesBytes;
             WriteMeta();
-            _phase = ok ? RecordingSessionPhase.Completed : RecordingSessionPhase.Failed;
+            _phase = ok
+                ? RecordingSessionPhase.Completed
+                : (partial ? RecordingSessionPhase.FailedPartial : RecordingSessionPhase.Failed);
             SetVisual("idle");
             SetStatus(ok ? "API completed" : "API failed");
-            Toast.Show(ok ? "API capture completed" : Trim(string.IsNullOrEmpty(validation) ? reason : validation));
+            if (ok)
+            {
+                string saved = "Saved session=" + _sessionId + " frames=" + _savedFrames +
+                               " dir=" + _framesDir + " bytes=" + framesBytes;
+                if (_tracking && !string.IsNullOrEmpty(_trackingPath))
+                {
+                    saved += " tracking=" + _trackingPath + " bytes=" + trackingBytes;
+                }
+
+                LogWindow.Info(saved);
+                Toast.Show("Saved " + _savedFrames + " frames " + FormatBytes(framesBytes));
+            }
+            else
+            {
+                Toast.Show(Trim(string.IsNullOrEmpty(validation) ? reason : validation));
+            }
+
             Log(ok ? "ApiSessionCompleted" : "ApiSessionFailed",
-                reason + " frames=" + _encodedFrames + " validation=" + (validation ?? ""));
+                reason + " frames=" + _savedFrames + " validation=" + (validation ?? "") +
+                " framesBytes=" + framesBytes);
         }
 
-        private string Validate()
+        private string Validate(string flushError)
         {
-            if (_encodedFrames <= 0 || !File.Exists(_videoPath))
+            if (!string.IsNullOrEmpty(flushError))
             {
-                return "video was requested but no MP4 samples were written";
+                return flushError;
             }
 
-            FileInfo info = new FileInfo(_videoPath);
-            if (info.Length <= 0)
+            if (_savedFrames <= 0 || !Directory.Exists(_framesDir))
             {
-                return "mp4 exists but length is 0";
+                return "frames were requested but none were written";
             }
 
-            try
+            if (!File.Exists(_framesJsonlPath) || new FileInfo(_framesJsonlPath).Length <= 0)
             {
-                byte[] header = new byte[Math.Min(64, (int)info.Length)];
-                using (FileStream stream = File.OpenRead(_videoPath))
-                {
-                    stream.Read(header, 0, header.Length);
-                }
-
-                string ascii = System.Text.Encoding.ASCII.GetString(header);
-                if (ascii.IndexOf("ftyp", StringComparison.Ordinal) < 0)
-                {
-                    return "mp4 missing ftyp";
-                }
-            }
-            catch (Exception exception)
-            {
-                return "mp4 header read failed: " + exception.Message;
+                return "frames.jsonl missing or empty";
             }
 
-            if (!FileContains(_videoPath, "moov"))
+            string firstJpg = Path.Combine(_framesDir, "000000.jpg");
+            if (!File.Exists(firstJpg) || new FileInfo(firstJpg).Length <= 0)
             {
-                return "mp4 missing moov";
+                return "first JPEG missing: " + firstJpg;
             }
 
             if (_tracking && _trackingSamples <= 0)
@@ -1027,28 +1084,26 @@ namespace Robot
             return null;
         }
 
-        private static bool FileContains(string path, string token)
+        private static long DirBytes(string dir)
         {
+            if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir))
+            {
+                return 0;
+            }
+
+            long total = 0;
             try
             {
-                const int budget = 1024 * 1024;
-                using (FileStream stream = File.OpenRead(path))
+                foreach (string path in Directory.GetFiles(dir))
                 {
-                    int size = (int)Math.Min(stream.Length, budget);
-                    byte[] buffer = new byte[size];
-                    if (stream.Length > budget)
-                    {
-                        stream.Seek(-size, SeekOrigin.End);
-                    }
-
-                    stream.Read(buffer, 0, size);
-                    return System.Text.Encoding.ASCII.GetString(buffer).IndexOf(token, StringComparison.Ordinal) >= 0;
+                    total += new FileInfo(path).Length;
                 }
             }
             catch
             {
-                return false;
             }
+
+            return total;
         }
 
         private void WriteMeta()
@@ -1084,7 +1139,33 @@ namespace Robot
         {
             string message = "session=" + _sessionId + " event=" + eventName + " " + detail;
             Debug.Log("[ApiFrame] " + message);
-            LogWindow.Info(message);
+            if (eventName == "ApiCaptureRequested" || eventName == "ApiStopRequested" ||
+                eventName == "ApiSessionCompleted" || eventName == "ApiSessionFailed")
+            {
+                if (eventName == "ApiSessionFailed")
+                {
+                    LogWindow.Error(message);
+                }
+                else
+                {
+                    LogWindow.Info(message);
+                }
+            }
+        }
+
+        private static string FormatBytes(long bytes)
+        {
+            if (bytes < 1024)
+            {
+                return bytes + " B";
+            }
+
+            if (bytes < 1024 * 1024)
+            {
+                return (bytes / 1024.0).ToString("0.0", CultureInfo.InvariantCulture) + " KB";
+            }
+
+            return (bytes / (1024.0 * 1024.0)).ToString("0.00", CultureInfo.InvariantCulture) + " MB";
         }
 
         private static PXRCaptureRenderMode ParseMode(string mode)

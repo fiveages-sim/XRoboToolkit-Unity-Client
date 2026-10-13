@@ -1,4 +1,4 @@
-﻿{
+{
     "name": "PICO.Platform",
     "references": [
         "Unity.XR.PICO.Editor",
@@ -9,6 +9,13 @@
     "includePlatforms": [],
     "excludePlatforms": [],
     "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [
+        "UnityEngine.UnityWebRequestModule.dll",
+        "UnityEngine.UnityWebRequestTextureModule.dll"
+    ],
+    "autoReferenced": true,
+    "noEngineReferences": false,
     "versionDefines": [
         {
             "name": "com.unity.xr.management",

@@ -120,14 +120,15 @@ namespace Robot
 
             if (TrackingTypeValue == TrackingType.Body)
             {
-                int state = 0;
-                PXR_Input.GetMotionTrackerCalibState(ref state);
+                // SDK 3.4.0: GetMotionTrackerCalibState is obsolete(error). Use GetBodyTrackingState.
+                bool isTracking = false;
+                BodyTrackingStatus bodyStatus = new BodyTrackingStatus();
+                int stateRet = PXR_MotionTracking.GetBodyTrackingState(ref isTracking, ref bodyStatus);
 
-                if (state == 1)
+                if (stateRet == 0 && isTracking && bodyStatus.stateCode == BodyTrackingStatusCode.BT_VALID)
                 {
                     // Get the current tracking mode
                     MotionTrackerMode trackingMode = PXR_MotionTracking.GetMotionTrackerMode();
-                    // Debug.Log("trackingMode::" + trackingMode);
                     // Update human tracking pose data
                     if (trackingMode == MotionTrackerMode.BodyTracking)
                     {
@@ -172,8 +173,8 @@ namespace Robot
 
         private JsonData GetMotionTracking()
         {
-            MotionTrackerConnectState mtcs = new MotionTrackerConnectState();
-            int ret = PXR_MotionTracking.GetMotionTrackerConnectStateWithSN(ref mtcs);
+            // SDK 3.4.0: GetMotionTrackerConnectStateWithSN / GetMotionTrackerLocations are obsolete(error).
+            long[] trackerIds = MotionTrackerConnectionCache.GetConnectedIds();
 
             int len = 0;
             JsonData joints;
@@ -188,65 +189,46 @@ namespace Robot
                 _motionTrackingJson["joints"] = joints;
             }
 
-
-            if (ret == 0)
+            for (int i = 0; i < trackerIds.Length; i++)
             {
-                if (mtcs.trackersSN.Length > 0)
+                long trackerId = trackerIds[i];
+                MotionTrackerLocation location = new MotionTrackerLocation();
+                bool isValidPose = false;
+                int result = PXR_MotionTracking.GetMotionTrackerLocation(trackerId, ref location, ref isValidPose);
+                if (result != 0 || !isValidPose)
                 {
-                    for (int i = 0; i < mtcs.trackerSum; i++)
-                    {
-                        string sn = mtcs.trackersSN[i].value.ToString().Trim();
-                        if (!string.IsNullOrEmpty(sn))
-                        {
-                            //Obtain estimated position and rotation values for each somatosensory tracker
-                            MotionTrackerLocations locations = new MotionTrackerLocations();
-                            MotionTrackerConfidence confidence = new MotionTrackerConfidence();
-                            int result =
-                                PXR_MotionTracking.GetMotionTrackerLocations(mtcs.trackersSN[i], ref locations,
-                                    ref confidence);
-
-                            // If the position and rotation information are successfully obtained
-                            if (result == 0)
-                            {
-                                JsonData joint;
-                                if (len < joints.Count)
-                                {
-                                    joint = joints[len];
-                                }
-                                else
-                                {
-                                    joint = new JsonData();
-                                    joints.Add(joint);
-                                }
-
-                                len++;
-                                MotionTrackerLocation localLocation = locations.localLocation;
-
-                                joint["p"] = GetPoseStr(localLocation.pose.Position, localLocation.pose.Orientation);
-                                unsafe
-                                {
-                                    float* pVelo = localLocation.linearVelocity;
-                                    float* pAcce = localLocation.linearAcceleration;
-                                    float* pWVelo = localLocation.angularVelocity;
-                                    float* pWAcce = localLocation.angularAcceleration;
-
-                                    string va = pVelo[0] + "," + pVelo[1] + "," + pVelo[2] + "," + pWVelo[0] + "," +
-                                                pWVelo[1] +
-                                                "," + pWVelo[2];
-
-                                    joint["va"] = va;
-                                    string wva = pAcce[0] + "," + pAcce[1] + "," + pAcce[2] + "," + pWAcce[0] + "," +
-                                                 pWAcce[1] +
-                                                 "," + pWAcce[2];
-
-                                    joint["wva"] = wva;
-                                }
-
-                                joint["sn"] = sn;
-                            }
-                        }
-                    }
+                    continue;
                 }
+
+                JsonData joint;
+                if (len < joints.Count)
+                {
+                    joint = joints[len];
+                }
+                else
+                {
+                    joint = new JsonData();
+                    joints.Add(joint);
+                }
+
+                len++;
+                joint["p"] = GetPoseStr(location.pose.Position, location.pose.Orientation);
+                unsafe
+                {
+                    float* pVelo = location.linearVelocity;
+                    float* pAcce = location.linearAcceleration;
+                    float* pWVelo = location.angularVelocity;
+                    float* pWAcce = location.angularAcceleration;
+
+                    string va = pVelo[0] + "," + pVelo[1] + "," + pVelo[2] + "," + pWVelo[0] + "," +
+                                pWVelo[1] + "," + pWVelo[2];
+                    joint["va"] = va;
+                    string wva = pAcce[0] + "," + pAcce[1] + "," + pAcce[2] + "," + pWAcce[0] + "," +
+                                 pWAcce[1] + "," + pWAcce[2];
+                    joint["wva"] = wva;
+                }
+
+                joint["sn"] = trackerId.ToString();
             }
 
             _motionTrackingJson["len"] = len;

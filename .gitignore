@@ -79,3 +79,6 @@ crashlytics-build.properties
 .vsconfig
 UserSettings/
 PICO_logs/
+
+# Local SDK upgrade scratch
+.upgrade-3.4.0-backup/

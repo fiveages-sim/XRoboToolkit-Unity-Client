@@ -190,6 +190,9 @@ namespace Robot
 
             Debug.Log($"{Tag} started: {_fileWriter.RecordDir}, enableFileWrite={enableFileWrite}, " +
                 $"collectHeadPose={collectHeadPose}, collectControllerPose={collectControllerPose}");
+            string startMsg = "EnterpriseCollection started dir=" + _fileWriter.RecordDir;
+            LogWindow.Info(startMsg);
+            Toast.Show(enableFileWrite ? "EnterpriseCollection started" : "EnterpriseCollection started (no file write)");
         }
 
         private void TryAutoStart()
@@ -243,6 +246,10 @@ namespace Robot
                 $"pendingBeforeStop={pendingBeforeStop}, pendingAfterStop={writerStats.PendingAfterStop}, " +
                 $"enterpriseThreadAlive={(_enterpriseThread != null && _enterpriseThread.IsAlive)}, " +
                 $"writerThreadAlive={writerStats.WriterThreadAlive}");
+            string savedMsg = "EnterpriseCollection saved dir=" + recordDir +
+                              " pendingAfterStop=" + writerStats.PendingAfterStop;
+            LogWindow.Info(savedMsg);
+            Toast.Show("EnterpriseCollection saved");
         }
 
         private void StopFileWriter(string reason)
@@ -371,7 +378,8 @@ namespace Robot
                 double predictTimeMs = GetEnterpriseHeadPredictTimeMs();
                 PxrSensorState2 sensorState = new PxrSensorState2();
                 int sensorFrameIndex = 0;
-                int result = PXR_EnterprisePlugin.Pxr_GetPredictedMainSensorState2(
+                // SDK 3.4.0: Pxr_GetPredictedMainSensorState2 lives on PXR_Plugin (not EnterprisePlugin).
+                int result = PXR_Plugin.Pxr_GetPredictedMainSensorState2(
                     predictTimeMs,
                     ref sensorState,
                     ref sensorFrameIndex);

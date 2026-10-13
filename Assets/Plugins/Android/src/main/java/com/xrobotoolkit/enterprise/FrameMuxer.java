@@ -10,13 +10,18 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 
 /**
- * Encodes full RGBA frames into an MP4 without cropping or scaling.
+ * Encodes full RGBA frames into an MP4 without cropping.
  * Used by the experimental for4U image path so CameraRecord_*.mp4 keeps the
  * same naming and stop/finalize flow as the capturelib recorder.
+ *
+ * 2048x1536 RGBA→NV12 on CPU cannot sustain 30fps; start() therefore encodes at
+ * half resolution by default (still side-by-side 3D layout).
  */
 public final class FrameMuxer {
     private static final String TAG = "FrameMuxer";
     private static final String MIME = "video/avc";
+    private static final int DEFAULT_SCALE_NUM = 1;
+    private static final int DEFAULT_SCALE_DEN = 2;
 
     private MediaCodec codec;
     private MediaMuxer muxer;
@@ -25,28 +30,42 @@ public final class FrameMuxer {
     private int sourceHeight;
     private int encodeWidth;
     private int encodeHeight;
+    private int scaleNum = DEFAULT_SCALE_NUM;
+    private int scaleDen = DEFAULT_SCALE_DEN;
     private int trackIndex = -1;
     private boolean muxerStarted;
     private boolean released;
     private final MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
 
     public synchronized int start(String path, int width, int height, int bitrate, int fps) {
+        return startScaled(path, width, height, bitrate, fps, DEFAULT_SCALE_NUM, DEFAULT_SCALE_DEN);
+    }
+
+    /**
+     * @param scaleNum / scaleDen downsample factors (e.g. 1/2 = half resolution).
+     */
+    public synchronized int startScaled(String path, int width, int height, int bitrate, int fps,
+                                        int scaleNum, int scaleDen) {
         releaseInternal();
         if (path == null || path.length() == 0 || width <= 0 || height <= 0) {
             return -1;
         }
-
-        sourceWidth = width;
-        sourceHeight = height;
-        encodeWidth = (width + 1) & ~1;
-        encodeHeight = (height + 1) & ~1;
-        if (encodeWidth != width || encodeHeight != height) {
-            Log.w(TAG, "encoder requires even size; padding to " + encodeWidth + "x" + encodeHeight
-                    + " from " + width + "x" + height + " (pad only, no crop of valid pixels)");
+        if (scaleNum <= 0 || scaleDen <= 0) {
+            scaleNum = DEFAULT_SCALE_NUM;
+            scaleDen = DEFAULT_SCALE_DEN;
         }
 
+        this.scaleNum = scaleNum;
+        this.scaleDen = scaleDen;
+        sourceWidth = width;
+        sourceHeight = height;
+        int targetW = Math.max(2, (width * scaleNum) / scaleDen);
+        int targetH = Math.max(2, (height * scaleNum) / scaleDen);
+        encodeWidth = (targetW + 1) & ~1;
+        encodeHeight = (targetH + 1) & ~1;
+
         int safeFps = fps > 0 ? fps : 30;
-        int safeBitrate = bitrate > 0 ? bitrate : Math.max(8 * 1024 * 1024, encodeWidth * encodeHeight * 2);
+        int safeBitrate = bitrate > 0 ? bitrate : Math.max(4 * 1024 * 1024, encodeWidth * encodeHeight * 4);
         yuvScratch = new byte[encodeWidth * encodeHeight * 3 / 2];
 
         try {
@@ -66,6 +85,7 @@ public final class FrameMuxer {
             released = false;
             Log.i(TAG, "start path=" + path + " source=" + sourceWidth + "x" + sourceHeight
                     + " encode=" + encodeWidth + "x" + encodeHeight
+                    + " scale=" + scaleNum + "/" + scaleDen
                     + " bitrate=" + safeBitrate + " fps=" + safeFps);
             return 0;
         } catch (IOException error) {
@@ -92,12 +112,14 @@ public final class FrameMuxer {
 
         try {
             drain(false);
-            int inputIndex = codec.dequeueInputBuffer(10_000);
+            // Allow enough time for the previous frame to free an input slot.
+            int inputIndex = codec.dequeueInputBuffer(50_000);
             if (inputIndex < 0) {
                 return -4;
             }
 
-            rgbaToNv12(rgba, length, yuvScratch, sourceWidth, sourceHeight, encodeWidth, encodeHeight);
+            rgbaToNv12Scaled(rgba, length, yuvScratch,
+                    sourceWidth, sourceHeight, encodeWidth, encodeHeight, scaleNum, scaleDen);
             ByteBuffer input = codec.getInputBuffer(inputIndex);
             if (input == null) {
                 return -5;
@@ -145,7 +167,6 @@ public final class FrameMuxer {
             return;
         }
 
-        // Bound the wait so a missing EOS cannot freeze the Unity main thread / finalize worker.
         int spins = 0;
         while (spins++ < 48) {
             int outputIndex = codec.dequeueOutputBuffer(bufferInfo, endOfStream ? 3_000 : 0);
@@ -215,44 +236,54 @@ public final class FrameMuxer {
         yuvScratch = null;
     }
 
-    private static void rgbaToNv12(byte[] rgba, int length, byte[] nv12,
-                                   int sourceWidth, int sourceHeight,
-                                   int encodeWidth, int encodeHeight) {
+    /**
+     * Nearest-neighbor downsample + BT.601 RGBA→NV12 in one pass.
+     */
+    private static void rgbaToNv12Scaled(byte[] rgba, int length, byte[] nv12,
+                                         int sourceWidth, int sourceHeight,
+                                         int encodeWidth, int encodeHeight,
+                                         int scaleNum, int scaleDen) {
         int framePixels = encodeWidth * encodeHeight;
         int yIndex = 0;
         int uvIndex = framePixels;
         for (int row = 0; row < encodeHeight; row++) {
+            int srcRow = Math.min(sourceHeight - 1, (row * scaleDen) / scaleNum);
+            int srcRowBase = srcRow * sourceWidth;
             for (int col = 0; col < encodeWidth; col++) {
+                int srcCol = Math.min(sourceWidth - 1, (col * scaleDen) / scaleNum);
+                int i = (srcRowBase + srcCol) * 4;
                 int r = 0;
                 int g = 0;
                 int b = 0;
-                if (row < sourceHeight && col < sourceWidth) {
-                    int i = (row * sourceWidth + col) * 4;
-                    if (i + 2 < length) {
-                        r = rgba[i] & 0xff;
-                        g = rgba[i + 1] & 0xff;
-                        b = rgba[i + 2] & 0xff;
-                    }
+                if (i + 2 < length) {
+                    r = rgba[i] & 0xff;
+                    g = rgba[i + 1] & 0xff;
+                    b = rgba[i + 2] & 0xff;
                 }
                 int y = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
-                nv12[yIndex++] = (byte) clamp(y);
+                if (y < 0) {
+                    y = 0;
+                } else if (y > 255) {
+                    y = 255;
+                }
+                nv12[yIndex++] = (byte) y;
                 if ((row & 1) == 0 && (col & 1) == 0 && uvIndex + 1 < nv12.length) {
                     int u = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
                     int v = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
-                    nv12[uvIndex++] = (byte) clamp(u);
-                    nv12[uvIndex++] = (byte) clamp(v);
+                    if (u < 0) {
+                        u = 0;
+                    } else if (u > 255) {
+                        u = 255;
+                    }
+                    if (v < 0) {
+                        v = 0;
+                    } else if (v > 255) {
+                        v = 255;
+                    }
+                    nv12[uvIndex++] = (byte) u;
+                    nv12[uvIndex++] = (byte) v;
                 }
             }
         }
-    }
-
-    private static int clamp(int value) {
-        if (value < 0) {
-            return 0;
-        }
-        if (value > 255) {
-            return 255;
-        }
-        return value;
     }
 }

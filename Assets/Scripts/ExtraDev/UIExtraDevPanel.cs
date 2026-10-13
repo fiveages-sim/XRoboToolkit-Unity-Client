@@ -36,12 +36,45 @@ public class UIExtraDevPanel : MonoBehaviour
         TmpItem.gameObject.SetActive(false);
 #if UNITY_EDITOR
         Test();
-       return;
+        return;
 #endif
-        ExtDevTrackerConnectState connectState = new ExtDevTrackerConnectState();
-        PXR_MotionTracking.GetExtDevTrackerConnectState(ref connectState);
+        // SDK 3.4.0: GetExtDevTrackerConnectState is obsolete(error).
+        // Poll connected expand-device IDs + battery instead.
+        ExtDevTrackerConnectState connectState = BuildConnectStateFromExpandDevices();
         Debug.Log("connectState.extNumber:" + connectState.extNumber);
         RefreshUI(connectState);
+    }
+
+    private static ExtDevTrackerConnectState BuildConnectStateFromExpandDevices()
+    {
+        ExtDevTrackerConnectState connectState = new ExtDevTrackerConnectState();
+        connectState.info = new ExtDevTrackerInfo[6];
+
+        long[] devices;
+        int ret = PXR_MotionTracking.GetExpandDevice(out devices);
+        if (ret != 0 || devices == null || devices.Length == 0)
+        {
+            connectState.extNumber = 0;
+            return connectState;
+        }
+
+        int count = Math.Min(devices.Length, 6);
+        connectState.extNumber = count;
+        for (int i = 0; i < count; i++)
+        {
+            float battery = 0f;
+            XrBatteryChargingState charger = XrBatteryChargingState.XR_MOTION_TRACKER_CHARGING_STATE_UNCHARGED;
+            PXR_MotionTracking.GetExpandDeviceBattery(devices[i], ref battery, ref charger);
+
+            connectState.info[i] = new ExtDevTrackerInfo
+            {
+                trackerSN = new TrackerSN { value = devices[i].ToString() },
+                batteryVolume = (byte)Mathf.Clamp(Mathf.RoundToInt(battery * 10f), 0, 10),
+                chargerStatus = (byte)charger
+            };
+        }
+
+        return connectState;
     }
 
     [ContextMenu("Test")]
@@ -55,10 +88,12 @@ public class UIExtraDevPanel : MonoBehaviour
         state.info[0].chargerStatus = 0;
         state.info[0].batteryVolume = 1;
 
+        state.info[1] = new ExtDevTrackerInfo();
         state.info[1].trackerSN.value = "PA8E10MGH32293962";
         state.info[1].chargerStatus = 2;
         state.info[1].batteryVolume = 3;
 
+        state.info[2] = new ExtDevTrackerInfo();
         state.info[2].trackerSN.value = "PA8E10MGH32293961";
         state.info[2].chargerStatus = 4;
         state.info[2].batteryVolume = 5;

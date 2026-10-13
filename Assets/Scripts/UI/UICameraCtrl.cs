@@ -367,7 +367,9 @@ public partial class UICameraCtrl : MonoBehaviour
             RecordDialog.Show(() =>
             {
                 StartRecord(RecordDialog.ResolutionWidth, RecordDialog.ResolutionHeight,
-                    RecordDialog.Fps, RecordDialog.Bitrate, withTracking, RecordDialog.ExpImage);
+                    RecordDialog.Fps, RecordDialog.Bitrate, withTracking, RecordDialog.ExpImage,
+                    RecordDialog.ExpOutputRaw, RecordDialog.ExpEnableEis,
+                    RecordDialog.ExpEnableMctf, RecordDialog.ExpEnableMfnr);
             }, null);
         }
         else
@@ -381,13 +383,16 @@ public partial class UICameraCtrl : MonoBehaviour
     }
 
     private void StartRecord(int width, int height, int fps, int bitrate,
-        bool onTrackingData, int expImage = 0)
+        bool onTrackingData, int expImage = 0,
+        bool expOutputRaw = false, bool expEnableEis = false, bool expEnableMctf = false,
+        bool expEnableMfnr = true)
     {
         _useApiCapture = expImage == 1;
         if (_useApiCapture)
         {
             // Width/Height stay in the dialog for path A only. Path B uses the for4U buffer size.
-            _apiSession.Begin(this, fps, onTrackingData);
+            _apiSession.Begin(this, fps, onTrackingData,
+                expOutputRaw, expEnableEis, expEnableMctf, expEnableMfnr);
             return;
         }
 

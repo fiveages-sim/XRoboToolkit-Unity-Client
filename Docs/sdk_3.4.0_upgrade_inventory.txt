@@ -1,0 +1,100 @@
+PICO Integration 3.4.0 upgrade inventory
+checkpoint tag: checkpoint-pre-sdk-3.4.0
+old package.json version: 3.1.2
+new package.json version: 3.4.0
+
+=== Enterprise/android diff -rq ===
+Files '/home/fiveages/distrobox/ubuntu24/libraries/XRoboToolkit-Unity-Client/PICO Unity Integration SDK/Enterprise/android/CameraRenderingPlugin.aar' and /home/fiveages/Downloads/PICO-Unity-Integration-SDK-release_3.4.0/Enterprise/android/CameraRenderingPlugin.aar differ
+Files '/home/fiveages/distrobox/ubuntu24/libraries/XRoboToolkit-Unity-Client/PICO Unity Integration SDK/Enterprise/android/CameraRenderingPlugin.aar.meta' and /home/fiveages/Downloads/PICO-Unity-Integration-SDK-release_3.4.0/Enterprise/android/CameraRenderingPlugin.aar.meta differ
+Only in '/home/fiveages/distrobox/ubuntu24/libraries/XRoboToolkit-Unity-Client/PICO Unity Integration SDK/Enterprise/android': capturelib-0.0.7.aar
+Only in '/home/fiveages/distrobox/ubuntu24/libraries/XRoboToolkit-Unity-Client/PICO Unity Integration SDK/Enterprise/android': capturelib-0.0.7.aar.meta
+Only in /home/fiveages/Downloads/PICO-Unity-Integration-SDK-release_3.4.0/Enterprise/android: capturelib-release.aar
+Only in /home/fiveages/Downloads/PICO-Unity-Integration-SDK-release_3.4.0/Enterprise/android: capturelib-release.aar.meta
+Only in /home/fiveages/Downloads/PICO-Unity-Integration-SDK-release_3.4.0/Enterprise/android: gson-2.10.1.jar
+Only in /home/fiveages/Downloads/PICO-Unity-Integration-SDK-release_3.4.0/Enterprise/android: gson-2.10.1.jar.meta
+Files '/home/fiveages/distrobox/ubuntu24/libraries/XRoboToolkit-Unity-Client/PICO Unity Integration SDK/Enterprise/android/tob_api-release.aar' and /home/fiveages/Downloads/PICO-Unity-Integration-SDK-release_3.4.0/Enterprise/android/tob_api-release.aar differ
+Only in /home/fiveages/Downloads/PICO-Unity-Integration-SDK-release_3.4.0/Enterprise/android: tobservicelib-4.3.24.aar
+Only in /home/fiveages/Downloads/PICO-Unity-Integration-SDK-release_3.4.0/Enterprise/android: tobservicelib-4.3.24.aar.meta
+Only in '/home/fiveages/distrobox/ubuntu24/libraries/XRoboToolkit-Unity-Client/PICO Unity Integration SDK/Enterprise/android': tobservicelib-release.aar
+Only in '/home/fiveages/distrobox/ubuntu24/libraries/XRoboToolkit-Unity-Client/PICO Unity Integration SDK/Enterprise/android': tobservicelib-release.aar.meta
+
+
+=== OLD SDK android ===
+BAuthLib-1.0.0.aar: classes=10 sos=[]
+  key: com/pvr/tobauthlib/BuildConfig.class
+CameraRenderingPlugin.aar: classes=4 sos=['jni/arm64-v8a/libCameraRenderingPlugin.so']
+  key: com/pxr/cameraplugin/BuildConfig.class
+capturelib-0.0.7.aar: classes=6 sos=['jni/arm64-v8a/libpvrcapturelib.so']
+  key: com/pxr/capturelib/BuildConfig.class, com/pxr/capturelib/PXRCamera$Companion.class, com/pxr/capturelib/PXRCamera$PXRCaptureRenderMode.class, com/pxr/capturelib/PXRCamera$PXRCaptureState.class, com/pxr/capturelib/PXRCamera.class, com/pxr/capturelib/PXRCameraCallBack.class
+tob_api-release.aar: classes=55 sos=['jni/arm64-v8a/libPICO_TOBAPI.so', 'jni/armeabi-v7a/libPICO_TOBAPI.so']
+  key: com/picoxr/tobservice/BuildConfig.class, com/picoxr/tobservice/ToBServiceUtils$1.class, com/picoxr/tobservice/ToBServiceUtils$10.class, com/picoxr/tobservice/ToBServiceUtils$11.class, com/picoxr/tobservice/ToBServiceUtils$12.class, com/picoxr/tobservice/ToBServiceUtils$13.class, com/picoxr/tobservice/ToBServiceUtils$14.class, com/picoxr/tobservice/ToBServiceUtils$15.class, com/picoxr/tobservice/ToBServiceUtils$16.class, com/picoxr/tobservice/ToBServiceUtils$17.class, com/picoxr/tobservice/ToBServiceUtils$18.class, com/picoxr/tobservice/ToBServiceUtils$19.class
+tobservicelib-release.aar: classes=221 sos=['jni/arm64-v8a/libtobservice.so', 'jni/armeabi-v7a/libtobservice.so', 'jni/x86/libtobservice.so', 'jni/x86_64/libtobservice.so']
+  key: com/pvr/tobservice/BuildConfig.class, com/pvr/tobservice/ToBServiceHelper$1.class, com/pvr/tobservice/ToBServiceHelper$2.class, com/pvr/tobservice/ToBServiceHelper$3.class, com/pvr/tobservice/ToBServiceHelper$BindCallBack.class, com/pvr/tobservice/ToBServiceHelper.class, com/pvr/tobservice/impl/ToBServiceProxyImpl$1.class, com/pvr/tobservice/impl/ToBServiceProxyImpl$10.class, com/pvr/tobservice/impl/ToBServiceProxyImpl$11.class, com/pvr/tobservice/impl/ToBServiceProxyImpl$12.class, com/pvr/tobservice/impl/ToBServiceProxyImpl$13.class, com/pvr/tobservice/impl/ToBServiceProxyImpl$14.class
+=== NEW SDK android ===
+BAuthLib-1.0.0.aar: classes=10 sos=[]
+  key: com/pvr/tobauthlib/BuildConfig.class
+CameraRenderingPlugin.aar: classes=4 sos=['jni/arm64-v8a/libCameraRenderingPlugin.so']
+  key: com/pxr/cameraplugin/BuildConfig.class
+capturelib-release.aar: classes=5 sos=['jni/arm64-v8a/libpvrcapturelib.so']
+  key: com/pxr/capturelib/BuildConfig.class, com/pxr/capturelib/PXRCapture$PXRCaptureRenderMode.class, com/pxr/capturelib/PXRCapture$PXRCaptureState.class, com/pxr/capturelib/PXRCapture.class, com/pxr/capturelib/PXRCaptureCallBack.class
+gson-2.10.1.jar: jar classes=218
+tob_api-release.aar: classes=57 sos=['jni/arm64-v8a/libPICO_TOBAPI.so']
+  key: com/picoxr/tobservice/BuildConfig.class, com/picoxr/tobservice/ToBServiceUtils$1.class, com/picoxr/tobservice/ToBServiceUtils$10.class, com/picoxr/tobservice/ToBServiceUtils$11.class, com/picoxr/tobservice/ToBServiceUtils$12.class, com/picoxr/tobservice/ToBServiceUtils$13.class, com/picoxr/tobservice/ToBServiceUtils$14.class, com/picoxr/tobservice/ToBServiceUtils$15.class, com/picoxr/tobservice/ToBServiceUtils$16.class, com/picoxr/tobservice/ToBServiceUtils$17.class, com/picoxr/tobservice/ToBServiceUtils$18.class, com/picoxr/tobservice/ToBServiceUtils$19.class
+tobservicelib-4.3.24.aar: classes=218 sos=['jni/arm64-v8a/libtobservice.so', 'jni/armeabi-v7a/libtobservice.so', 'jni/x86/libtobservice.so', 'jni/x86_64/libtobservice.so']
+  key: com/pvr/tobservice/BuildConfig.class, com/pvr/tobservice/ToBServiceHelper$1.class, com/pvr/tobservice/ToBServiceHelper$2.class, com/pvr/tobservice/ToBServiceHelper$3.class, com/pvr/tobservice/ToBServiceHelper$BindCallBack.class, com/pvr/tobservice/ToBServiceHelper.class, com/pvr/tobservice/impl/ToBServiceProxyImpl$1.class, com/pvr/tobservice/impl/ToBServiceProxyImpl$10.class, com/pvr/tobservice/impl/ToBServiceProxyImpl$11.class, com/pvr/tobservice/impl/ToBServiceProxyImpl$12.class, com/pvr/tobservice/impl/ToBServiceProxyImpl$13.class, com/pvr/tobservice/impl/ToBServiceProxyImpl$14.class
+=== Plugins Android ===
+capturelib-0.0.7.aar: classes=6 sos=['jni/arm64-v8a/libpvrcapturelib.so']
+  key: com/pxr/capturelib/BuildConfig.class, com/pxr/capturelib/PXRCamera$Companion.class, com/pxr/capturelib/PXRCamera$PXRCaptureRenderMode.class, com/pxr/capturelib/PXRCamera$PXRCaptureState.class, com/pxr/capturelib/PXRCamera.class, com/pxr/capturelib/PXRCameraCallBack.class
+fbolibrary.aar: classes=3 sos=[]
+robotassistant_lib-i18n-release.aar: classes=24 sos=[]
+  key: com/picovr/robotassistantlib/BuildConfig.class
+
+=== CONFLICT HOTSPOTS ===
+capturelib-0.0.7 ∩ capturelib-release classes: ['com/pxr/capturelib/BuildConfig.class']
+both ship libpvrcapturelib.so: YES (static)
+tobservicelib-release ∩ tobservicelib-4.3.24 class overlap count: 218
+decision: keep ONLY one tobservicelib (prefer 4.3.24 after CameraCapture dependency check)
+decision (updated 2026-10-13): ship BOTH with different .so names — release libpvrcapturelib.so (PXRCapture) + 0.0.7 libpvrcamera07lib.so (PXRCamera JNI); no class bytecode patch
+CameraCapture uses file: 3.4.0 SDK which includes capturelib-release + tobservicelib-4.3.24 + gson + CameraRenderingPlugin
+
+Backup dir: .upgrade-3.4.0-backup/
+=== POST-UPGRADE PACKAGING (verified static) ===
+- package.json version: 3.4.0
+- tobservicelib: ONLY tobservicelib-4.3.24.aar (old tobservicelib-release removed with SDK replace)
+- capturelib-release: Enterprise/android full official AAR (PXRCapture + libpvrcapturelib.so + BuildConfig)
+- Vision capturelib: Assets/Plugins/Android/capturelib-0.0.7.aar with original PXRCamera* classes + libpvrcamera07lib.so (BuildConfig omitted; D8-verified)
+- Duplicate Java classes across packaged AARs: 0; two distinct .so filenames so both JNI sets load
+- Pose compat: PXR_EnterprisePlugin.PoseCompat.cs + PoseInfo.cs restored
+- checkpoint tag: checkpoint-pre-sdk-3.4.0
+
+=== DEVICE REGRESSION CHECKLIST (run on PICO 4 Ultra Enterprise) ===
+[ ] Non exp_Image Vision start/stop + Saved path/bytes in LogWindow
+[ ] Tracking-only + Vision+Tracking
+[ ] EIS still off (full FOV) via CaptureOpener + capturelib-0.0.7
+[ ] EnterpriseCollection start/stop Toast + dir
+[ ] Passthrough + teleop StartSendImage (no ClassNotFound PXRCamera)
+[ ] LogWindow not flooded by SetConfig/StateCallback
+[ ] exp_Image=1: raw/EIS meta flags, record, Saved line
+[ ] No CNF / NSME / ULE / JNI fatal in logcat
+
+=== UNITY EDITOR FIXES (Linux) ===
+1. unity_logo.mat was a Git LFS pointer in 3.4.0 source -> restored YAML from checkpoint-pre-sdk-3.4.0
+2. Pico Ambisonic Renderer / Pico Audio Router: no Linux Editor native (.so). Sample mixers stripped of those effects so Linux Editor import does not spam. Device Android plugins remain under SpatialAudio/Plugins/Android.
+
+=== exp_Image dict UI (2026-10-13) ===
+- RecordDialog row: exp_Image + Raw/EIS/MCTF/MFNR (flags interactable only when exp_Image=1)
+- Defaults: Raw=0, EIS=0, MCTF=0, MFNR=1
+- ApiFrameSession Configure/Open use dialog flags; meta + LogWindow print them
+
+=== exp_Image SIGSEGV root cause (2026-10-13) ===
+logcat: getBinderRet:0 → CaptureLib mPXRCamera=NULL → crash getCameraParametersNew in libCameraRenderingPlugin.so
+CameraRenderingPlugin Java requires PXRCapture (capturelib-release). Missing it left binder null.
+fix: ship capturelib-release + dual .so (see packaging).
+
+=== Vision ULE after dual ship (2026-10-13) ===
+PXRCamera.setCallback UnsatisfiedLinkError: 0.0.7 and release both named libpvrcapturelib.so but export
+disjoint JNI (PXRCamera_* vs PXRCapture_*). pickFirst kept only release → Vision broke.
+fix: rename 0.0.7 so to libpvrcamera07lib.so (do NOT bytecode-patch PXRCamera — D8 IllegalArgumentException).
+CaptureOpener + CameraHandle preload System.loadLibrary("pvrcamera07lib") before PXRCamera; ART resolves
+PXRCamera_* from that .so while PXRCapture still loads libpvrcapturelib.so.
+exp_Image encode: half-res FrameMuxer (1/2) + sbyte[] JNI; Raw mutually exclusive with EIS/MCTF/MFNR.

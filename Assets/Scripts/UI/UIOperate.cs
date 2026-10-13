@@ -77,6 +77,7 @@ public class UIOperate : MonoBehaviour
         HighAccuracy.onValueChanged.AddListener(OnHighAccuracy);
         ReconnectBtn.onClick.AddListener(OnReconnectBtn);
         EnableCollectionStreams();
+        MotionTrackerConnectionCache.EnsureSubscribed();
         //The shared network function is only available on B-end devices.
         NetshareTog.gameObject.SetActive(false);
         // Bypass getting sn via enterprise service to enable data transport
@@ -194,7 +195,9 @@ public class UIOperate : MonoBehaviour
                 $"USB static IP setter returned {result}, but the configured addresses already match.");
         }
 
-        PXR_Enterprise.EnableUsbTetheringStaticIP();
+        // SDK 3.4.0: EnableUsbTetheringStaticIP removed; use official switch enum 104.
+        PXR_Enterprise.SwitchSystemFunction(
+            SystemFunctionSwitchEnum.SFS_USB_TETHERING_STATIC_IP_ENABLED, SwitchEnum.S_ON);
         PXR_Enterprise.SwitchSystemFunction(
             SystemFunctionSwitchEnum.SFS_USB_TETHERING, SwitchEnum.S_OFF);
         yield return new WaitForSecondsRealtime(1.0f);
@@ -230,7 +233,8 @@ public class UIOperate : MonoBehaviour
     {
         _usbTetheringRecoveryInProgress = true;
         Debug.LogWarning($"USB address {UsbTetheringLocalAddress} is missing; restarting USB tethering.");
-        PXR_Enterprise.EnableUsbTetheringStaticIP();
+        PXR_Enterprise.SwitchSystemFunction(
+            SystemFunctionSwitchEnum.SFS_USB_TETHERING_STATIC_IP_ENABLED, SwitchEnum.S_ON);
         PXR_Enterprise.SwitchSystemFunction(
             SystemFunctionSwitchEnum.SFS_USB_TETHERING, SwitchEnum.S_OFF);
         yield return new WaitForSecondsRealtime(0.5f);
@@ -503,10 +507,8 @@ public class UIOperate : MonoBehaviour
         }
         else
         {
-            MotionTrackerConnectState state = new MotionTrackerConnectState();
-            PXR_MotionTracking.GetMotionTrackerConnectStateWithSN(ref state);
-            //  PXR_MotionTracking.GetMotionTrackerConnectStateWithSN(ref state);
-            TrackNum.text = "Num: " + state.trackerSum;
+            int trackerSum = MotionTrackerConnectionCache.Count;
+            TrackNum.text = "Num: " + trackerSum;
 
             if (tType == TrackingData.TrackingType.Body)
             {
@@ -519,7 +521,7 @@ public class UIOperate : MonoBehaviour
                 // Enable full body motion capture default mode
                 int ret = PXR_MotionTracking.StartBodyTracking(mode, boneLength);
                 BodyInfo.text = "Start BodyTracking " + ret;
-                Debug.Log(" UpdateBodyTracking :" + ret + " trackerSum:" + state.trackerSum);
+                Debug.Log(" UpdateBodyTracking :" + ret + " trackerSum:" + trackerSum);
             }
             else if (tType == TrackingData.TrackingType.Motion)
             {
