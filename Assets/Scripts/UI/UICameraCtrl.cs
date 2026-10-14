@@ -276,10 +276,18 @@ public partial class UICameraCtrl : MonoBehaviour
 
     public void SetRecordStatus(string text)
     {
-        if (RecordStatusText != null)
+        if (RecordStatusText == null)
         {
-            RecordStatusText.text = text;
+            return;
         }
+
+        string clipped = text ?? "";
+        if (clipped.Length > 18)
+        {
+            clipped = clipped.Substring(0, 17) + "…";
+        }
+
+        RecordStatusText.text = clipped;
     }
 
     private void EnsureRecordStatusText()
@@ -308,8 +316,8 @@ public partial class UICameraCtrl : MonoBehaviour
         text.fontSize = 14;
         text.color = Color.white;
         text.alignment = TextAnchor.MiddleRight;
-        text.horizontalOverflow = HorizontalWrapMode.Overflow;
-        text.verticalOverflow = VerticalWrapMode.Overflow;
+        text.horizontalOverflow = HorizontalWrapMode.Wrap;
+        text.verticalOverflow = VerticalWrapMode.Truncate;
         text.raycastTarget = false;
 
         RectTransform rect = statusObject.GetComponent<RectTransform>();
@@ -317,7 +325,7 @@ public partial class UICameraCtrl : MonoBehaviour
         rect.anchorMax = new Vector2(1f, 1f);
         rect.pivot = new Vector2(1f, 1f);
         rect.anchoredPosition = new Vector2(-8f, -6f);
-        rect.sizeDelta = new Vector2(150f, 20f);
+        rect.sizeDelta = new Vector2(120f, 36f);
         RecordStatusText = text;
     }
 
@@ -342,17 +350,29 @@ public partial class UICameraCtrl : MonoBehaviour
         }
     }
 
+    private bool AnyRecordSessionActive()
+    {
+        return _session.IsActive || _apiSession.IsActive || _surfaceProbe.IsActive;
+    }
+
     private void OnRecordBtn(bool on)
     {
-        bool anyActive = _session.IsActive || _apiSession.IsActive || _surfaceProbe.IsActive;
+        bool anyActive = AnyRecordSessionActive();
 
         // CustomButton toggles via Invoke(!On) but only SetVisual/SetOn updates On.
         // If a probe left the button out of sync, a click may arrive as on=true while
         // a session is already active — treat that as Stop, not a no-op.
         if (anyActive)
         {
-            StopRecord();
+            // Show Stopping first; Vision Finish is synchronous and sets idle inside StopRecord.
+            // Do not leave the button stuck on Stopping after a sync stop completes.
             SetRecordVisual("stopping");
+            StopRecord();
+            if (!AnyRecordSessionActive())
+            {
+                SetRecordVisual("idle");
+            }
+
             return;
         }
 
@@ -386,7 +406,8 @@ public partial class UICameraCtrl : MonoBehaviour
                     RecordDialog.ExpOutputRaw, RecordDialog.ExpEnableEis,
                     RecordDialog.ExpEnableMctf, RecordDialog.ExpEnableMfnr,
                     RecordDialog.ExpEyeMode, RecordDialog.ExpTargetFps,
-                    RecordDialog.ExpBufferWidth, RecordDialog.ExpBufferHeight);
+                    RecordDialog.ExpBufferWidth, RecordDialog.ExpBufferHeight,
+                    RecordDialog.ExpPreviewWidth, RecordDialog.ExpPreviewHeight);
             }, null);
         }
         else
@@ -403,7 +424,8 @@ public partial class UICameraCtrl : MonoBehaviour
         bool onTrackingData, int expImage = 0,
         bool expOutputRaw = false, bool expEnableEis = false, bool expEnableMctf = false,
         bool expEnableMfnr = true, string eyeMode = "LEFT", int targetFps = 30,
-        int bufferWidth = 2048, int bufferHeight = 1536)
+        int bufferWidth = 2048, int bufferHeight = 1536,
+        int previewWidth = 4096, int previewHeight = 1536)
     {
         // Optional B0 pattern probe only. B1/production Surface is exp_Image=1.
         int probeMode = Robot.SurfaceEncodeProbe.ResolveMode();
@@ -412,7 +434,7 @@ public partial class UICameraCtrl : MonoBehaviour
             _useSurfaceProbe = true;
             _useApiCapture = false;
             LogWindow.Warn("SurfaceEncodeProbe B0 pattern — skipping Vision/for4U.");
-            SetRecordStatus("B0 probe starting…");
+            SetRecordStatus("B0…");
             _surfaceProbe.BeginPattern(this, fps, onTrackingData);
             return;
         }
@@ -424,22 +446,24 @@ public partial class UICameraCtrl : MonoBehaviour
             _useSurfaceProbe = true;
             int surfaceFps = targetFps == 60 ? 60 : 30;
             int surfaceBitrate = bitrate > 0 ? bitrate : Robot.SurfaceEncodeProbe.DefaultBitrateBps;
-            LogWindow.Info("Starting for4U Surface encode (exp_Image=1) " + eyeMode + " " +
-                           bufferWidth + "x" + bufferHeight + "@" + surfaceFps +
+            LogWindow.Info("Starting for4U Surface encode (exp_Image=1) " + eyeMode +
+                           " encode=" + bufferWidth + "x" + bufferHeight +
+                           " preview=" + previewWidth + "x" + previewHeight +
+                           "@" + surfaceFps +
                            " raw=" + (expOutputRaw ? 1 : 0) +
                            " eis=" + (expEnableEis ? 1 : 0) +
                            " mctf=" + (expEnableMctf ? 1 : 0) +
                            " mfnr=" + (expEnableMfnr ? 1 : 0));
-            SetRecordStatus("for4U Surface starting…");
+            SetRecordStatus("Surface…");
             _surfaceProbe.BeginCamera(this, eyeMode, bufferWidth, bufferHeight, surfaceFps,
                 surfaceBitrate, onTrackingData, expOutputRaw, expEnableEis, expEnableMctf,
-                expEnableMfnr);
+                expEnableMfnr, previewWidth, previewHeight);
             return;
         }
 
         _useApiCapture = false;
         LogWindow.Info("Starting Vision StartRecord (exp_Image=0) " + width + "x" + height + "@" + fps);
-        SetRecordStatus("Vision starting…");
+        SetRecordStatus("Vision…");
         _session.Begin(this, width, height, fps, bitrate, true, onTrackingData);
     }
 

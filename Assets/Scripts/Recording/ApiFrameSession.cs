@@ -232,7 +232,7 @@ namespace Robot
             }
 
             SetVisual("starting");
-            SetStatus("API starting");
+            SetStatus("API…");
             string flags = "exp_Image=1 raw=" + (_outputCameraRawData ? 1 : 0) +
                            " eis=" + (_enableEis ? 1 : 0) +
                            " mctf=" + (_enableMctf ? 1 : 0) +
@@ -269,7 +269,7 @@ namespace Robot
                 ? "stopped during startup: " + reason
                 : reason;
             SetVisual("stopping");
-            SetStatus("API stopping");
+            SetStatus("Stopping…");
         }
 
         public void Pump()
@@ -867,7 +867,7 @@ namespace Robot
             _meta["recordingConfirmedUtc"] = DateTime.UtcNow.ToString("o");
             WriteMeta();
             SetVisual("recording");
-            SetStatus("API recording");
+            SetStatus("Recording");
             Toast.Show("API frames started");
             Log("ApiRecordingConfirmed",
                 _pixelFormat + " " + _actualWidth + "x" + _actualHeight + " mode=" + _cameraMode +
@@ -924,7 +924,7 @@ namespace Robot
             _pendingStopReason = null;
             _phase = RecordingSessionPhase.Stopping;
             SetVisual("stopping");
-            SetStatus("API stopping");
+            SetStatus("Stopping…");
             if (_routine != null && _host != null)
             {
                 _host.StopCoroutine(_routine);
@@ -1070,7 +1070,7 @@ namespace Robot
                 ? RecordingSessionPhase.Completed
                 : (partial ? RecordingSessionPhase.FailedPartial : RecordingSessionPhase.Failed);
             SetVisual("idle");
-            SetStatus(ok ? "API completed" : "API failed");
+            SetStatus(ok ? "Done" : "Failed");
             if (ok)
             {
                 string saved = "Saved session=" + _sessionId + " frames=" + _savedFrames +

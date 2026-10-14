@@ -18,8 +18,17 @@ public class RecordDialog : MonoBehaviour
     public Text expImageLabel;
     public Image expImageBackground;
 
-    public const int BufferWidth = 2048;
-    public const int BufferHeight = 1536;
+    /// <summary>Per-eye encode width (4:3 mono; half of SBS).</summary>
+    public const int EyeWidth = 2048;
+
+    /// <summary>Per-eye encode height (4:3).</summary>
+    public const int EyeHeight = 1536;
+
+    /// <summary>Side-by-side preview/encode width for 3D (8:3 total).</summary>
+    public const int SbsWidth = 4096;
+
+    public const int BufferWidth = EyeWidth;
+    public const int BufferHeight = EyeHeight;
 
     private Action _confirm;
     private Action _cancel;
@@ -96,14 +105,54 @@ public class RecordDialog : MonoBehaviour
     /// <summary>Requested capture/encode fps for Surface path (30 or 60).</summary>
     public int ExpTargetFps { get; private set; } = 30;
 
+    /// <summary>Encode W for Surface path: mono 2048, 3D 4096.</summary>
     public int ExpBufferWidth
     {
-        get { return BufferWidth; }
+        get
+        {
+            int w;
+            int h;
+            ResolveEncodeSize(ExpEyeMode, out w, out h);
+            return w;
+        }
     }
 
+    /// <summary>Encode H for Surface path (always 1536).</summary>
     public int ExpBufferHeight
     {
-        get { return BufferHeight; }
+        get
+        {
+            int w;
+            int h;
+            ResolveEncodeSize(ExpEyeMode, out w, out h);
+            return h;
+        }
+    }
+
+    /// <summary>StartPreview canvas W (always SBS 4096 for for4U Surface).</summary>
+    public int ExpPreviewWidth
+    {
+        get { return SbsWidth; }
+    }
+
+    /// <summary>StartPreview canvas H (always 1536).</summary>
+    public int ExpPreviewHeight
+    {
+        get { return EyeHeight; }
+    }
+
+    /// <summary>LEFT/RIGHT → 2048×1536; 3D → 4096×1536.</summary>
+    public static void ResolveEncodeSize(string eyeMode, out int width, out int height)
+    {
+        height = EyeHeight;
+        if (string.Equals(eyeMode, "3D", StringComparison.OrdinalIgnoreCase))
+        {
+            width = SbsWidth;
+        }
+        else
+        {
+            width = EyeWidth;
+        }
     }
 
     private void Start()

@@ -1,5 +1,6 @@
 package com.xrobotoolkit.enterprise;
 
+import android.graphics.SurfaceTexture;
 import android.media.MediaCodec;
 import android.media.MediaCodecInfo;
 import android.media.MediaFormat;
@@ -10,6 +11,7 @@ import android.opengl.EGLContext;
 import android.opengl.EGLDisplay;
 import android.opengl.EGLExt;
 import android.opengl.EGLSurface;
+import android.opengl.GLES11Ext;
 import android.opengl.GLES20;
 import android.os.SystemClock;
 import android.util.Log;
@@ -22,7 +24,11 @@ import java.io.OutputStreamWriter;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.FloatBuffer;
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -54,6 +60,16 @@ public final class SurfaceVideoEncoder {
     private Surface inputSurface;
     private Thread drainThread;
     private Thread patternThread;
+    private Thread cropThread;
+
+    private SurfaceTexture cameraSurfaceTexture;
+    private Surface cameraSurface;
+    private int previewWidth;
+    private int previewHeight;
+    private volatile String cropEye = "LEFT";
+    private final AtomicBoolean cropRun = new AtomicBoolean(false);
+    private final AtomicBoolean cropFrameAvailable = new AtomicBoolean(false);
+    private CountDownLatch cameraSurfaceReady;
 
     private int width;
     private int height;
@@ -111,12 +127,24 @@ public final class SurfaceVideoEncoder {
         return inputSurface;
     }
 
+    /** Camera preview Surface for mono eye-crop path (SBS canvas). */
+    public Surface getCameraSurface() {
+        return cameraSurface;
+    }
+
     /**
      * Native Surface handle for PICO StartPreviewfor4U(IntPtr). Uses reflection;
      * returns 0 if unavailable.
      */
     public long getInputSurfaceNativeHandle() {
-        Surface surface = inputSurface;
+        return nativeHandleOf(inputSurface);
+    }
+
+    public long getCameraSurfaceNativeHandle() {
+        return nativeHandleOf(cameraSurface);
+    }
+
+    private static long nativeHandleOf(Surface surface) {
         if (surface == null) {
             return 0L;
         }
@@ -134,7 +162,7 @@ public final class SurfaceVideoEncoder {
             field.setAccessible(true);
             return field.getLong(surface);
         } catch (Throwable error) {
-            Log.w(TAG, "getInputSurfaceNativeHandle failed", error);
+            Log.w(TAG, "nativeHandleOf failed", error);
             return 0L;
         }
     }
@@ -291,6 +319,89 @@ public final class SurfaceVideoEncoder {
     }
 
     /**
+     * Mono path: create a SBS-sized SurfaceTexture for StartPreviewfor4U.
+     * Must be called after start() while RECORDING. Blocks until GL surface is ready.
+     */
+    public int createCameraSurface(int previewW, int previewH) {
+        synchronized (lock) {
+            if (inputSurface == null || state.get() != STATE_RECORDING) {
+                return -1;
+            }
+            if (cameraSurface != null) {
+                return 0;
+            }
+            if (previewW <= 0 || previewH <= 0) {
+                return -2;
+            }
+            previewWidth = previewW;
+            previewHeight = previewH;
+            cameraSurfaceReady = new CountDownLatch(1);
+            cropRun.set(false);
+            cropThread = new Thread(this::eyeCropSetupAndWait, "SurfaceVideoEncoderEyeCrop");
+            cropThread.setDaemon(true);
+            cropThread.start();
+        }
+        try {
+            if (!cameraSurfaceReady.await(5, TimeUnit.SECONDS) || cameraSurface == null) {
+                lastError = appendError(lastError, "createCameraSurface timeout");
+                return -3;
+            }
+            return 0;
+        } catch (InterruptedException error) {
+            lastError = appendError(lastError, "createCameraSurface interrupted");
+            return -4;
+        }
+    }
+
+    /**
+     * Begin blitting LEFT or RIGHT half of the camera SBS canvas into the encoder Surface.
+     */
+    public int startEyeCropProducer(String eye) {
+        synchronized (lock) {
+            if (cameraSurface == null || inputSurface == null || state.get() != STATE_RECORDING) {
+                return -1;
+            }
+            if (eye != null && eye.equalsIgnoreCase("RIGHT")) {
+                cropEye = "RIGHT";
+            } else {
+                cropEye = "LEFT";
+            }
+            cropRun.set(true);
+            return 0;
+        }
+    }
+
+    public void stopEyeCropProducer() {
+        cropRun.set(false);
+        cropFrameAvailable.set(true); // wake waiters
+        Thread thread = cropThread;
+        if (thread != null) {
+            try {
+                thread.join(3000);
+            } catch (InterruptedException ignored) {
+            }
+        }
+        cropThread = null;
+    }
+
+    private void releaseCameraSurfaceLocked() {
+        if (cameraSurface != null) {
+            try {
+                cameraSurface.release();
+            } catch (Throwable ignored) {
+            }
+            cameraSurface = null;
+        }
+        if (cameraSurfaceTexture != null) {
+            try {
+                cameraSurfaceTexture.release();
+            } catch (Throwable ignored) {
+            }
+            cameraSurfaceTexture = null;
+        }
+    }
+
+    /**
      * Stop producer (caller must stop camera/pattern first or pass stopPattern=true),
      * signal EOS, drain encoder, finalize muxer.
      *
@@ -308,6 +419,7 @@ public final class SurfaceVideoEncoder {
         if (stopPattern) {
             stopPatternProducer();
         }
+        stopEyeCropProducer();
 
         synchronized (lock) {
             noteState(STATE_DRAINING_ENCODER);
@@ -463,6 +575,243 @@ public final class SurfaceVideoEncoder {
         }
     }
 
+    /**
+     * Mono eye-crop: GLES samples camera SBS SurfaceTexture and blits LEFT/RIGHT half
+     * into the MediaCodec input Surface (encode size = one eye).
+     */
+    private void eyeCropSetupAndWait() {
+        EGLDisplay display = EGL14.EGL_NO_DISPLAY;
+        EGLContext context = EGL14.EGL_NO_CONTEXT;
+        EGLSurface eglSurface = EGL14.EGL_NO_SURFACE;
+        int oesTex = 0;
+        int program = 0;
+        FloatBuffer vertBuf = null;
+        final float[] stMatrix = new float[16];
+        try {
+            display = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY);
+            if (display == EGL14.EGL_NO_DISPLAY) {
+                throw new RuntimeException("eglGetDisplay failed");
+            }
+            int[] version = new int[2];
+            if (!EGL14.eglInitialize(display, version, 0, version, 1)) {
+                throw new RuntimeException("eglInitialize failed");
+            }
+            int[] attribList = {
+                    EGL14.EGL_RED_SIZE, 8,
+                    EGL14.EGL_GREEN_SIZE, 8,
+                    EGL14.EGL_BLUE_SIZE, 8,
+                    EGL14.EGL_ALPHA_SIZE, 8,
+                    EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
+                    EGL14.EGL_SURFACE_TYPE, EGL14.EGL_WINDOW_BIT,
+                    EGL14.EGL_NONE
+            };
+            EGLConfig[] configs = new EGLConfig[1];
+            int[] numConfigs = new int[1];
+            if (!EGL14.eglChooseConfig(display, attribList, 0, configs, 0, 1, numConfigs, 0)
+                    || numConfigs[0] <= 0) {
+                throw new RuntimeException("eglChooseConfig failed");
+            }
+            int[] ctxAttrib = {EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE};
+            context = EGL14.eglCreateContext(display, configs[0], EGL14.EGL_NO_CONTEXT, ctxAttrib, 0);
+            if (context == EGL14.EGL_NO_CONTEXT) {
+                throw new RuntimeException("eglCreateContext failed");
+            }
+            int[] surfaceAttrib = {EGL14.EGL_NONE};
+            eglSurface = EGL14.eglCreateWindowSurface(display, configs[0], inputSurface, surfaceAttrib, 0);
+            if (eglSurface == EGL14.EGL_NO_SURFACE) {
+                throw new RuntimeException("eglCreateWindowSurface failed");
+            }
+            if (!EGL14.eglMakeCurrent(display, eglSurface, eglSurface, context)) {
+                throw new RuntimeException("eglMakeCurrent failed");
+            }
+
+            int[] textures = new int[1];
+            GLES20.glGenTextures(1, textures, 0);
+            oesTex = textures[0];
+            GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTex);
+            GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,
+                    GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR);
+            GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,
+                    GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR);
+            GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,
+                    GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE);
+            GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,
+                    GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE);
+
+            cameraSurfaceTexture = new SurfaceTexture(oesTex);
+            cameraSurfaceTexture.setDefaultBufferSize(previewWidth, previewHeight);
+            cameraSurfaceTexture.setOnFrameAvailableListener(st -> cropFrameAvailable.set(true));
+            cameraSurface = new Surface(cameraSurfaceTexture);
+
+            program = buildEyeCropProgram();
+            if (program == 0) {
+                throw new RuntimeException("eye-crop program failed");
+            }
+            vertBuf = ByteBuffer.allocateDirect(4 * 4 * 4).order(ByteOrder.nativeOrder())
+                    .asFloatBuffer();
+
+            if (cameraSurfaceReady != null) {
+                cameraSurfaceReady.countDown();
+            }
+
+            // Wait until startEyeCropProducer enables blitting (or stop).
+            while (!cropRun.get() && state.get() == STATE_RECORDING) {
+                try {
+                    Thread.sleep(10);
+                } catch (InterruptedException ignored) {
+                }
+            }
+
+            int uTex = GLES20.glGetUniformLocation(program, "sTexture");
+            int uMatrix = GLES20.glGetUniformLocation(program, "uSTMatrix");
+            int uCrop = GLES20.glGetUniformLocation(program, "uCrop");
+            int aPos = GLES20.glGetAttribLocation(program, "aPosition");
+            int aTex = GLES20.glGetAttribLocation(program, "aTexCoord");
+
+            // Fullscreen triangle strip: x,y,u,v (u,v base 0..1; crop applied in shader).
+            float[] quad = {
+                    -1f, -1f, 0f, 0f,
+                    1f, -1f, 1f, 0f,
+                    -1f, 1f, 0f, 1f,
+                    1f, 1f, 1f, 1f
+            };
+            vertBuf.put(quad).position(0);
+
+            while (cropRun.get() && state.get() == STATE_RECORDING) {
+                if (!cropFrameAvailable.get()) {
+                    try {
+                        Thread.sleep(2);
+                    } catch (InterruptedException ignored) {
+                    }
+                    continue;
+                }
+                cropFrameAvailable.set(false);
+                cameraSurfaceTexture.updateTexImage();
+                cameraSurfaceTexture.getTransformMatrix(stMatrix);
+                long ptsNs = cameraSurfaceTexture.getTimestamp();
+
+                float cropX = "RIGHT".equals(cropEye) ? 0.5f : 0f;
+                GLES20.glViewport(0, 0, width, height);
+                GLES20.glClearColor(0f, 0f, 0f, 1f);
+                GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT);
+                GLES20.glUseProgram(program);
+                GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
+                GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTex);
+                GLES20.glUniform1i(uTex, 0);
+                GLES20.glUniformMatrix4fv(uMatrix, 1, false, stMatrix, 0);
+                GLES20.glUniform2f(uCrop, cropX, 0.5f);
+
+                vertBuf.position(0);
+                GLES20.glEnableVertexAttribArray(aPos);
+                GLES20.glVertexAttribPointer(aPos, 2, GLES20.GL_FLOAT, false, 16, vertBuf);
+                vertBuf.position(2);
+                GLES20.glEnableVertexAttribArray(aTex);
+                GLES20.glVertexAttribPointer(aTex, 2, GLES20.GL_FLOAT, false, 16, vertBuf);
+                GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
+                GLES20.glDisableVertexAttribArray(aPos);
+                GLES20.glDisableVertexAttribArray(aTex);
+
+                if (ptsNs > 0) {
+                    EGLExt.eglPresentationTimeANDROID(display, eglSurface, ptsNs);
+                }
+                if (!EGL14.eglSwapBuffers(display, eglSurface)) {
+                    lastError = appendError(lastError, "eye-crop eglSwapBuffers failed");
+                    encoderErrors.incrementAndGet();
+                    break;
+                }
+                patternSubmitted.incrementAndGet();
+            }
+        } catch (Throwable error) {
+            lastError = appendError(lastError, "eye-crop: " + error.getMessage());
+            encoderErrors.incrementAndGet();
+            Log.e(TAG, "eye-crop failed", error);
+            if (cameraSurfaceReady != null) {
+                cameraSurfaceReady.countDown();
+            }
+        } finally {
+            releaseCameraSurfaceLocked();
+            try {
+                if (oesTex != 0) {
+                    int[] del = {oesTex};
+                    GLES20.glDeleteTextures(1, del, 0);
+                }
+            } catch (Throwable ignored) {
+            }
+            try {
+                if (program != 0) {
+                    GLES20.glDeleteProgram(program);
+                }
+            } catch (Throwable ignored) {
+            }
+            if (display != EGL14.EGL_NO_DISPLAY) {
+                EGL14.eglMakeCurrent(display, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE,
+                        EGL14.EGL_NO_CONTEXT);
+                if (eglSurface != EGL14.EGL_NO_SURFACE) {
+                    EGL14.eglDestroySurface(display, eglSurface);
+                }
+                if (context != EGL14.EGL_NO_CONTEXT) {
+                    EGL14.eglDestroyContext(display, context);
+                }
+                EGL14.eglTerminate(display);
+            }
+        }
+    }
+
+    private static int buildEyeCropProgram() {
+        final String vs =
+                "attribute vec4 aPosition;\n"
+                        + "attribute vec4 aTexCoord;\n"
+                        + "uniform mat4 uSTMatrix;\n"
+                        + "uniform vec2 uCrop;\n"
+                        + "varying vec2 vTex;\n"
+                        + "void main() {\n"
+                        + "  gl_Position = aPosition;\n"
+                        + "  vec4 t = vec4(aTexCoord.x * uCrop.y + uCrop.x, aTexCoord.y, 0.0, 1.0);\n"
+                        + "  vTex = (uSTMatrix * t).xy;\n"
+                        + "}\n";
+        final String fs =
+                "#extension GL_OES_EGL_image_external : require\n"
+                        + "precision mediump float;\n"
+                        + "varying vec2 vTex;\n"
+                        + "uniform samplerExternalOES sTexture;\n"
+                        + "void main() {\n"
+                        + "  gl_FragColor = texture2D(sTexture, vTex);\n"
+                        + "}\n";
+        int v = loadShader(GLES20.GL_VERTEX_SHADER, vs);
+        int f = loadShader(GLES20.GL_FRAGMENT_SHADER, fs);
+        if (v == 0 || f == 0) {
+            return 0;
+        }
+        int program = GLES20.glCreateProgram();
+        GLES20.glAttachShader(program, v);
+        GLES20.glAttachShader(program, f);
+        GLES20.glLinkProgram(program);
+        int[] link = new int[1];
+        GLES20.glGetProgramiv(program, GLES20.GL_LINK_STATUS, link, 0);
+        GLES20.glDeleteShader(v);
+        GLES20.glDeleteShader(f);
+        if (link[0] != GLES20.GL_TRUE) {
+            Log.e(TAG, "eye-crop link: " + GLES20.glGetProgramInfoLog(program));
+            GLES20.glDeleteProgram(program);
+            return 0;
+        }
+        return program;
+    }
+
+    private static int loadShader(int type, String source) {
+        int shader = GLES20.glCreateShader(type);
+        GLES20.glShaderSource(shader, source);
+        GLES20.glCompileShader(shader);
+        int[] compiled = new int[1];
+        GLES20.glGetShaderiv(shader, GLES20.GL_COMPILE_STATUS, compiled, 0);
+        if (compiled[0] == 0) {
+            Log.e(TAG, "shader: " + GLES20.glGetShaderInfoLog(shader));
+            GLES20.glDeleteShader(shader);
+            return 0;
+        }
+        return shader;
+    }
+
     private void drainLoop() {
         while (drainRun.get() || !eosSeen.get()) {
             MediaCodec localCodec;
@@ -601,6 +950,7 @@ public final class SurfaceVideoEncoder {
             }
             frameMapWriter = null;
         }
+        releaseCameraSurfaceLocked();
         if (codec != null) {
             try {
                 codec.stop();

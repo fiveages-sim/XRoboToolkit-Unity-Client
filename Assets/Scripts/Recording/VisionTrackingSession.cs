@@ -468,7 +468,7 @@ namespace Robot
                 "3D side-by-side keeps each eye at 4:3, the same aspect as the capture sensor. " +
                 "SetConfig enables EIS, which crops the frame; EIS is turned off after SetConfig. " +
                 "eisDisableResult 1 is native success.";
-            SetStatus("Camera ready");
+            SetStatus("Ready");
             try
             {
                 EnsureDownloadDir();
@@ -709,7 +709,8 @@ namespace Robot
             _meta["videoBytes"] = FileLength(_videoPath);
             _meta["trackingBytes"] = FileLength(_trackingPath);
             WriteMeta();
-            Phase = finalPhase;
+            // Leave Stopping so IsActive becomes false immediately; keep final status in meta.
+            Phase = RecordingSessionPhase.Idle;
 
             string summary = "status=" + _meta["status"] + " reason=" + reason +
                              (string.IsNullOrEmpty(validationError) ? "" : " validation=" + validationError);
@@ -740,7 +741,8 @@ namespace Robot
             }
 
             SetVisual("idle");
-            SetStatus(finalPhase + " " + CapturePipeline.StateName(CameraHandle.LastCallbackState));
+            SetStatus(finalPhase == RecordingSessionPhase.Completed ? "Done" :
+                finalPhase == RecordingSessionPhase.FailedPartial ? "Partial" : "Failed");
         }
 
         private string ValidateFiles()

@@ -22,10 +22,15 @@ namespace Robot
 
         public const int ProbeWidth = 1024;
         public const int ProbeHeight = 1024;
-        public const int DefaultWidth = ApiFrameSession.BufferWidth;
-        public const int DefaultHeight = ApiFrameSession.BufferHeight;
+        public const int EyeWidth = 2048;
+        public const int EyeHeight = 1536;
+        public const int SbsWidth = 4096;
+        public const int DefaultWidth = EyeWidth;
+        public const int DefaultHeight = EyeHeight;
         public const int DefaultBitrateBps = 8 * 1000 * 1000;
         public const string EncodePathId = "for4u-surface-mediacodec";
+        /// <summary>Max seconds stuck in Starting before ForceReset (open camera + crop + preview).</summary>
+        public const float StartTimeoutSeconds = 20f;
 
         private UICameraCtrl _host;
         private Coroutine _routine;
@@ -48,7 +53,11 @@ namespace Robot
         private int _bitrateBps;
         private int _width;
         private int _height;
+        private int _previewWidth;
+        private int _previewHeight;
+        private int _requestedBitrateBps;
         private string _eyeMode = "LEFT";
+        private bool _useEyeCrop;
         private bool _outputRaw;
         private bool _enableEis;
         private bool _enableMctf;
@@ -60,8 +69,10 @@ namespace Robot
         private double _videoStartPredictTimeUs;
         private string _videoStartUtc;
         private long _lastDiskCheckMs;
+        private float _startedRealtime;
         private AndroidJavaObject _encoder;
         private AndroidJavaObject _inputSurfaceJava;
+        private AndroidJavaObject _cameraSurfaceJava;
         private IntPtr _surfaceGlobalRef = IntPtr.Zero;
 
         public bool IsActive
@@ -191,6 +202,19 @@ namespace Robot
                 _inputSurfaceJava = null;
             }
 
+            if (_cameraSurfaceJava != null)
+            {
+                try
+                {
+                    _cameraSurfaceJava.Dispose();
+                }
+                catch
+                {
+                }
+
+                _cameraSurfaceJava = null;
+            }
+
             if (_encoder != null)
             {
                 try
@@ -223,21 +247,21 @@ namespace Robot
 
         public void BeginPattern(UICameraCtrl host, int fps, bool tracking)
         {
-            Begin(host, ModePatternB0, "LEFT", ProbeWidth, ProbeHeight, fps, DefaultBitrateBps,
-                tracking, false, false, false, false);
+            Begin(host, ModePatternB0, "LEFT", ProbeWidth, ProbeHeight, ProbeWidth, ProbeHeight,
+                fps, DefaultBitrateBps, tracking, false, false, false, false);
         }
 
         public void BeginCamera(UICameraCtrl host, string eyeMode, int width, int height, int fps,
             int bitrateBps, bool tracking, bool outputRaw, bool enableEis, bool enableMctf,
-            bool enableMfnr)
+            bool enableMfnr, int previewWidth = SbsWidth, int previewHeight = EyeHeight)
         {
-            Begin(host, ModeCameraB1, eyeMode, width, height, fps, bitrateBps, tracking,
-                outputRaw, enableEis, enableMctf, enableMfnr);
+            Begin(host, ModeCameraB1, eyeMode, width, height, previewWidth, previewHeight, fps,
+                bitrateBps, tracking, outputRaw, enableEis, enableMctf, enableMfnr);
         }
 
         public void Begin(UICameraCtrl host, int mode, string eyeMode, int width, int height,
-            int fps, int bitrateBps, bool tracking, bool outputRaw, bool enableEis,
-            bool enableMctf, bool enableMfnr)
+            int previewWidth, int previewHeight, int fps, int bitrateBps, bool tracking,
+            bool outputRaw, bool enableEis, bool enableMctf, bool enableMfnr)
         {
             if (IsActive || host == null)
             {
@@ -253,13 +277,25 @@ namespace Robot
             _host = host;
             _mode = mode;
             _eyeMode = NormalizeEyeMode(eyeMode);
-            _width = width > 0 ? width : DefaultWidth;
-            _height = height > 0 ? height : DefaultHeight;
-            if (mode == ModePatternB0)
+            if (mode == ModeCameraB1)
+            {
+                int encodeW;
+                int encodeH;
+                RecordDialog.ResolveEncodeSize(_eyeMode, out encodeW, out encodeH);
+                _width = encodeW;
+                _height = encodeH;
+                _previewWidth = previewWidth > 0 ? previewWidth : SbsWidth;
+                _previewHeight = previewHeight > 0 ? previewHeight : EyeHeight;
+                _useEyeCrop = _eyeMode != "3D";
+            }
+            else
             {
                 _width = ProbeWidth;
                 _height = ProbeHeight;
+                _previewWidth = ProbeWidth;
+                _previewHeight = ProbeHeight;
                 _eyeMode = "LEFT";
+                _useEyeCrop = false;
                 outputRaw = false;
                 enableEis = false;
                 enableMctf = false;
@@ -272,7 +308,9 @@ namespace Robot
                 _fps = 30;
             }
 
-            _bitrateBps = bitrateBps > 0 ? bitrateBps : DefaultBitrateBps;
+            _requestedBitrateBps = bitrateBps > 0 ? bitrateBps : DefaultBitrateBps;
+            int scale = Mathf.Max(1, _width / EyeWidth);
+            _bitrateBps = _requestedBitrateBps * scale;
             _trackingEnabled = tracking;
             _outputRaw = outputRaw;
             _enableEis = enableEis;
@@ -293,6 +331,7 @@ namespace Robot
             _trackingFirstElapsedRealtimeNs = 0;
             _trackingLastElapsedRealtimeNs = 0;
             _lastDiskCheckMs = 0;
+            _startedRealtime = Time.realtimeSinceStartup;
             _phase = RecordingSessionPhase.Starting;
             _sessionId = DateTime.Now.ToString("yyyyMMdd_HHmmss");
             string download = VisionTrackingSession.DownloadDir;
@@ -334,7 +373,28 @@ namespace Robot
             _meta["requestedEyeMode"] = _eyeMode;
             _meta["requestedWidth"] = _width;
             _meta["requestedHeight"] = _height;
+            _meta["encodeSize"] = _width + "x" + _height;
+            _meta["previewSize"] = _previewWidth + "x" + _previewHeight;
+            _meta["surfacePath"] = _useEyeCrop ? "eye-crop" : "direct";
+            _meta["cropHalf"] = !_useEyeCrop ? "none" :
+                (_eyeMode == "RIGHT" ? "right" : "left");
+            if (_useEyeCrop)
+            {
+                _meta["layout"] = _eyeMode + " SBS half cropped to full " + _width + "x" + _height +
+                                  " (4:3)";
+            }
+            else if (_eyeMode == "3D")
+            {
+                _meta["layout"] = "3D SBS " + _width + "x" + _height +
+                                  " (8:3, each eye 4:3)";
+            }
+            else
+            {
+                _meta["layout"] = _eyeMode + " " + _width + "x" + _height;
+            }
+
             _meta["requestedFps"] = _fps;
+            _meta["requestedBitrateBps"] = _requestedBitrateBps;
             _meta["outputCameraRawData"] = _outputRaw;
             _meta["enableEis"] = _enableEis;
             _meta["enableMctf"] = _enableMctf;
@@ -412,6 +472,27 @@ namespace Robot
                 return;
             }
 
+            // Starting watchdog: dead coroutine or total start budget exceeded → ForceReset.
+            if (_phase == RecordingSessionPhase.Starting)
+            {
+                if (NeedsForceStop())
+                {
+                    ForceReset("starting_coroutine_lost");
+                    return;
+                }
+
+                if (Time.realtimeSinceStartup - _startedRealtime >= StartTimeoutSeconds)
+                {
+                    if (_meta != null)
+                    {
+                        _meta["startTimeoutSec"] = StartTimeoutSeconds;
+                    }
+
+                    ForceReset("starting_timeout");
+                    return;
+                }
+            }
+
             long now = (long)(Time.realtimeSinceStartup * 1000.0);
             if (now - _lastDiskCheckMs >= 30000)
             {
@@ -471,8 +552,10 @@ namespace Robot
 #if UNITY_ANDROID && !UNITY_EDITOR
         private IEnumerator Run()
         {
-            SetStatus("probe starting");
+            SetStatus("Starting…");
             string failReason = null;
+            // Cooperative start budget (Pump also ForceResets at StartTimeoutSeconds).
+            float startDeadline = _startedRealtime + StartTimeoutSeconds;
 
             int startResult = -99;
             Exception startEx = null;
@@ -550,6 +633,16 @@ namespace Robot
                 }
             }
 
+            if (failReason == null && !_finalized && !_stopRequested
+                && Time.realtimeSinceStartup >= startDeadline)
+            {
+                failReason = "starting timeout after " + StartTimeoutSeconds + "s";
+                if (_meta != null)
+                {
+                    _meta["startTimeoutSec"] = StartTimeoutSeconds;
+                }
+            }
+
             if (failReason == null && !_finalized && !_stopRequested)
             {
                 if (_trackingEnabled)
@@ -561,7 +654,7 @@ namespace Robot
                 _meta["status"] = "recording";
                 WriteMeta();
                 SetVisual("recording");
-                SetStatus(_mode == ModePatternB0 ? "B0 pattern recording" : "for4U Surface recording");
+                SetStatus(_mode == ModePatternB0 ? "B0 recording" : "Recording");
                 LogWindow.Info("[SurfaceEncodeProbe] recording " +
                                (_mode == ModePatternB0 ? "B0" : "for4U Surface") +
                                " " + _eyeMode + " " + _width + "x" + _height + "@" + _fps +
@@ -677,21 +770,85 @@ namespace Robot
 
             _cameraOpen = true;
 
+            int previewW = _useEyeCrop ? _previewWidth : _width;
+            int previewH = _useEyeCrop ? _previewHeight : _height;
+            if (_useEyeCrop)
+            {
+                int cropCreate = -99;
+                Exception cropCreateEx = null;
+                try
+                {
+                    cropCreate = _encoder.Call<int>("createCameraSurface", previewW, previewH);
+                }
+                catch (Exception exception)
+                {
+                    cropCreateEx = exception;
+                }
+
+                _meta["createCameraSurfaceResult"] = cropCreate;
+                if (cropCreateEx != null)
+                {
+                    _meta["previewFailReason"] = "createCameraSurface: " + cropCreateEx.Message;
+                    yield break;
+                }
+
+                if (cropCreate != 0)
+                {
+                    _meta["previewFailReason"] = "createCameraSurface returned " + cropCreate;
+                    yield break;
+                }
+
+                int cropStart = -99;
+                Exception cropStartEx = null;
+                try
+                {
+                    cropStart = _encoder.Call<int>("startEyeCropProducer", _eyeMode);
+                }
+                catch (Exception exception)
+                {
+                    cropStartEx = exception;
+                }
+
+                _meta["startEyeCropResult"] = cropStart;
+                if (cropStartEx != null)
+                {
+                    _meta["previewFailReason"] = "startEyeCropProducer: " + cropStartEx.Message;
+                    yield break;
+                }
+
+                if (cropStart != 0)
+                {
+                    _meta["previewFailReason"] = "startEyeCropProducer returned " + cropStart;
+                    yield break;
+                }
+            }
+
             // Prefer Java Surface jobject (NewGlobalRef). Reflection getNativeObject can SIGSEGV.
             IntPtr surfacePtr = IntPtr.Zero;
             string surfaceMethod = "none";
             Exception surfaceEx = null;
+            string surfaceGetter = _useEyeCrop ? "getCameraSurface" : "getInputSurface";
+            string nativeGetter = _useEyeCrop ? "getCameraSurfaceNativeHandle" : "getInputSurfaceNativeHandle";
             try
             {
-                _inputSurfaceJava = _encoder.Call<AndroidJavaObject>("getInputSurface");
-                if (_inputSurfaceJava != null)
+                AndroidJavaObject surfaceObj = _encoder.Call<AndroidJavaObject>(surfaceGetter);
+                if (_useEyeCrop)
                 {
-                    IntPtr local = _inputSurfaceJava.GetRawObject();
+                    _cameraSurfaceJava = surfaceObj;
+                }
+                else
+                {
+                    _inputSurfaceJava = surfaceObj;
+                }
+
+                if (surfaceObj != null)
+                {
+                    IntPtr local = surfaceObj.GetRawObject();
                     if (local != IntPtr.Zero)
                     {
                         _surfaceGlobalRef = AndroidJNI.NewGlobalRef(local);
                         surfacePtr = _surfaceGlobalRef;
-                        surfaceMethod = "jobject_NewGlobalRef";
+                        surfaceMethod = "jobject_NewGlobalRef_" + surfaceGetter;
                     }
                 }
             }
@@ -710,13 +867,13 @@ namespace Robot
                 Exception nativeEx = null;
                 try
                 {
-                    long nativeHandle = _encoder.Call<long>("getInputSurfaceNativeHandle");
-                    _meta["inputSurfaceNativeHandle"] =
+                    long nativeHandle = _encoder.Call<long>(nativeGetter);
+                    _meta["previewSurfaceNativeHandle"] =
                         nativeHandle.ToString(CultureInfo.InvariantCulture);
                     if (nativeHandle != 0)
                     {
                         surfacePtr = new IntPtr(nativeHandle);
-                        surfaceMethod = "reflection_getNativeObject_fallback";
+                        surfaceMethod = "reflection_" + nativeGetter;
                     }
                 }
                 catch (Exception exception)
@@ -731,7 +888,11 @@ namespace Robot
             }
 
             _meta["surfacePassMethod"] = surfaceMethod;
-            _meta["startPreviewPluginSize"] = _width + "x" + _height + " passed to native startPreview";
+            _meta["surfacePath"] = _useEyeCrop ? "eye-crop" : "direct";
+            _meta["startPreviewPluginSize"] =
+                previewW + "x" + previewH + " passed to native startPreview";
+            _meta["encodeSize"] = _width + "x" + _height;
+            _meta["previewSize"] = previewW + "x" + previewH;
             _meta["outputCameraRawData"] = _outputRaw;
             _meta["previewEyeMode"] = _eyeMode;
             if (surfacePtr == IntPtr.Zero)
@@ -745,7 +906,7 @@ namespace Robot
             PXRCaptureRenderMode renderMode = ParseRenderMode(_eyeMode);
             try
             {
-                previewOk = PXR_Enterprise.StartPreviewfor4U(surfacePtr, renderMode, _width, _height);
+                previewOk = PXR_Enterprise.StartPreviewfor4U(surfacePtr, renderMode, previewW, previewH);
             }
             catch (Exception exception)
             {
@@ -811,7 +972,7 @@ namespace Robot
             _stopRequested = true;
             _phase = RecordingSessionPhase.Stopping;
             SetVisual("stopping");
-            SetStatus("probe stopping");
+            SetStatus("Stopping…");
 
             if (_routine != null && _host != null)
             {
@@ -841,8 +1002,9 @@ namespace Robot
             {
                 if (_encoder != null)
                 {
-                    bool stopPattern = _mode == ModePatternB0;
-                    int stopResult = _encoder.Call<int>("stop", stopPattern);
+                    // Always stop pattern/crop producers inside Java stop().
+                    bool stopProducers = _mode == ModePatternB0 || _useEyeCrop;
+                    int stopResult = _encoder.Call<int>("stop", stopProducers);
                     _meta["encoderStopResult"] = stopResult;
                     _meta["encoderStats"] = _encoder.Call<string>("getStatsJson");
                     _meta["encoderStateTimeline"] = _encoder.Call<string>("getStateTimeline");
@@ -897,7 +1059,13 @@ namespace Robot
             _meta["eyeMode"] = _eyeMode;
             _meta["width"] = _width;
             _meta["height"] = _height;
+            _meta["encodeSize"] = _width + "x" + _height;
+            _meta["previewSize"] = _previewWidth + "x" + _previewHeight;
+            _meta["surfacePath"] = _useEyeCrop ? "eye-crop" : "direct";
+            _meta["cropHalf"] = !_useEyeCrop ? "none" :
+                (_eyeMode == "RIGHT" ? "right" : "left");
             _meta["requestedFps"] = _fps;
+            _meta["requestedBitrateBps"] = _requestedBitrateBps;
             _meta["bitrateBps"] = _bitrateBps;
             _meta["raw"] = _outputRaw;
             _meta["eis"] = _enableEis;
