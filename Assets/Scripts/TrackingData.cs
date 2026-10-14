@@ -106,11 +106,7 @@ namespace Robot
 
             if (HandTrackingOn)
             {
-                //  ActiveInputDevice activeInputDevice = PXR_HandTracking.GetActiveInputDevice();
-                //  if (activeInputDevice == ActiveInputDevice.HandTrackingActive)
-                {
-                    totalData["Hand"] = GetHandJsonData();
-                }
+                totalData["Hand"] = BuildHandJson();
             }
             else
             {
@@ -120,25 +116,9 @@ namespace Robot
 
             if (TrackingTypeValue == TrackingType.Body)
             {
-                // SDK 3.4.0: GetMotionTrackerCalibState is obsolete(error). Use GetBodyTrackingState.
-                bool isTracking = false;
-                BodyTrackingStatus bodyStatus = new BodyTrackingStatus();
-                int stateRet = PXR_MotionTracking.GetBodyTrackingState(ref isTracking, ref bodyStatus);
-
-                if (stateRet == 0 && isTracking && bodyStatus.stateCode == BodyTrackingStatusCode.BT_VALID)
+                if (TryBuildBodyJson(out JsonData bodyJson))
                 {
-                    // Get the current tracking mode
-                    MotionTrackerMode trackingMode = PXR_MotionTracking.GetMotionTrackerMode();
-                    // Update human tracking pose data
-                    if (trackingMode == MotionTrackerMode.BodyTracking)
-                    {
-                        BodyTrackingGetDataInfo dataInfo = new BodyTrackingGetDataInfo();
-                        BodyTrackingData trackingData = new BodyTrackingData();
-                        // Obtain position and orientation data of each body node
-                        int ret = PXR_MotionTracking.GetBodyTrackingData(ref dataInfo, ref trackingData);
-                        JsonData json = GetBodyTracking(dataInfo, trackingData);
-                        totalData["Body"] = json;
-                    }
+                    totalData["Body"] = bodyJson;
                 }
             }
             else
@@ -149,12 +129,9 @@ namespace Robot
 
             if (TrackingTypeValue == TrackingType.Motion)
             {
-                MotionTrackerMode trackingMode = PXR_MotionTracking.GetMotionTrackerMode();
-
-                if (trackingMode == MotionTrackerMode.MotionTracking)
+                if (TryBuildMotionJson(out JsonData motionJson))
                 {
-                    JsonData json = GetMotionTracking();
-                    totalData["Motion"] = json;
+                    totalData["Motion"] = motionJson;
                 }
             }
             else
@@ -171,7 +148,101 @@ namespace Robot
         }
 
 
-        private JsonData GetMotionTracking()
+        /// <summary>
+        /// UnityXR schema for Hand. Same field layout for Enterprise sidechannel.
+        /// </summary>
+        public JsonData BuildHandJson()
+        {
+            HandJointLocations leftHand = new HandJointLocations();
+            if (PXR_HandTracking.GetJointLocations(HandType.HandLeft, ref leftHand))
+            {
+                GetHandTrackingData(leftHand, ref _leftHandData);
+                _handData["leftHand"] = _leftHandData;
+            }
+
+            HandJointLocations rightHand = new HandJointLocations();
+            if (PXR_HandTracking.GetJointLocations(HandType.HandRight, ref rightHand))
+            {
+                GetHandTrackingData(rightHand, ref _rightHandData);
+                _handData["rightHand"] = _rightHandData;
+            }
+
+            return _handData;
+        }
+
+        /// <summary>
+        /// Samples Hand for the aux sidechannel. False when neither hand updated this call.
+        /// </summary>
+        public bool TryBuildHandJson(out JsonData handJson)
+        {
+            handJson = null;
+            bool any = false;
+            HandJointLocations leftHand = new HandJointLocations();
+            if (PXR_HandTracking.GetJointLocations(HandType.HandLeft, ref leftHand))
+            {
+                GetHandTrackingData(leftHand, ref _leftHandData);
+                _handData["leftHand"] = _leftHandData;
+                any = true;
+            }
+
+            HandJointLocations rightHand = new HandJointLocations();
+            if (PXR_HandTracking.GetJointLocations(HandType.HandRight, ref rightHand))
+            {
+                GetHandTrackingData(rightHand, ref _rightHandData);
+                _handData["rightHand"] = _rightHandData;
+                any = true;
+            }
+
+            if (!any)
+            {
+                return false;
+            }
+
+            handJson = _handData;
+            return true;
+        }
+
+        public bool TryBuildBodyJson(out JsonData bodyJson)
+        {
+            bodyJson = null;
+            bool isTracking = false;
+            BodyTrackingStatus bodyStatus = new BodyTrackingStatus();
+            int stateRet = PXR_MotionTracking.GetBodyTrackingState(ref isTracking, ref bodyStatus);
+            if (stateRet != 0 || !isTracking || bodyStatus.stateCode != BodyTrackingStatusCode.BT_VALID)
+            {
+                return false;
+            }
+
+            if (PXR_MotionTracking.GetMotionTrackerMode() != MotionTrackerMode.BodyTracking)
+            {
+                return false;
+            }
+
+            BodyTrackingGetDataInfo dataInfo = new BodyTrackingGetDataInfo();
+            BodyTrackingData trackingData = new BodyTrackingData();
+            int ret = PXR_MotionTracking.GetBodyTrackingData(ref dataInfo, ref trackingData);
+            if (ret != 0)
+            {
+                return false;
+            }
+
+            bodyJson = FillBodyTrackingJson(dataInfo, trackingData);
+            return true;
+        }
+
+        public bool TryBuildMotionJson(out JsonData motionJson)
+        {
+            motionJson = null;
+            if (PXR_MotionTracking.GetMotionTrackerMode() != MotionTrackerMode.MotionTracking)
+            {
+                return false;
+            }
+
+            motionJson = FillMotionTrackingJson();
+            return motionJson != null && motionJson.ContainsKey("len") && (int)motionJson["len"] > 0;
+        }
+
+        private JsonData FillMotionTrackingJson()
         {
             // SDK 3.4.0: GetMotionTrackerConnectStateWithSN / GetMotionTrackerLocations are obsolete(error).
             long[] trackerIds = MotionTrackerConnectionCache.GetConnectedIds();
@@ -236,7 +307,7 @@ namespace Robot
         }
 
 
-        private JsonData GetBodyTracking(BodyTrackingGetDataInfo dataInfo, BodyTrackingData trackingData)
+        private JsonData FillBodyTrackingJson(BodyTrackingGetDataInfo dataInfo, BodyTrackingData trackingData)
         {
             JsonData joints;
             if (_bodyTrackingJson.ContainsKey("joints"))
@@ -253,7 +324,7 @@ namespace Robot
             if (trackingData.roleDatas != null)
             {
                 int len = trackingData.roleDatas.Length;
-                _motionTrackingJson["len"] = len;
+                _bodyTrackingJson["len"] = len;
 
                 for (int i = 0; i < len; i++)
                 {
@@ -436,26 +507,6 @@ namespace Robot
             json["menuButton"] = menuButton;
         }
 
-
-        private JsonData GetHandJsonData()
-        {
-            HandJointLocations leftHand = new HandJointLocations();
-            if (PXR_HandTracking.GetJointLocations(HandType.HandLeft, ref leftHand))
-            {
-                GetHandTrackingData(leftHand, ref _leftHandData);
-                _handData["leftHand"] = _leftHandData;
-            }
-
-            HandJointLocations rightHand = new HandJointLocations();
-
-            if (PXR_HandTracking.GetJointLocations(HandType.HandRight, ref rightHand))
-            {
-                GetHandTrackingData(rightHand, ref _rightHandData);
-                _handData["rightHand"] = _rightHandData;
-            }
-
-            return _handData;
-        }
 
         private JsonData GetSensorJson(PxrSensorState2 sensorState)
         {

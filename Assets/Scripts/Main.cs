@@ -17,6 +17,7 @@ public class Main : MonoBehaviour
     private void Awake()
     {
         EnterpriseCollectionRecorder.EnsureCreated();
+        EnterpriseAuxTrackingSampler.EnsureCreated();
         DebugManager.instance.enableRuntimeUI = false;
         Application.logMessageReceived += OnLogMessageReceived;
         float clampedEyeTextureScale = Mathf.Clamp(eyeTextureResolutionScale, 0.7f, 1.0f);

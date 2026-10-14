@@ -68,6 +68,9 @@ namespace Robot
         private ControllerInputState _cachedRightControllerInput;
         private long _lastDirectTrackingHeadSampleSeq;
         private long _lastDirectTrackingControllerSampleSeq;
+        private long _lastDirectTrackingHandSampleSeq;
+        private long _lastDirectTrackingBodySampleSeq;
+        private long _lastDirectTrackingMotionSampleSeq;
         private float _lastHeardSend = 0;
         private float _lastReconnectTime = 0;
         private bool _reconnectEnable = false;
@@ -315,7 +318,6 @@ namespace Robot
             _sendDatas.Enqueue(new SendData(NetCMD.PACKET_CMD_CUSTOM_TO_PC, msg));
         }
 
-
         private void Update()
         {
             _cachedAppFocus = Application.isFocused;
@@ -451,8 +453,14 @@ namespace Robot
                     default(EnterpriseCollectionRecorder.EnterpriseControllerTcpPose);
                 EnterpriseCollectionRecorder.EnterpriseControllerTcpPose rightController =
                     default(EnterpriseCollectionRecorder.EnterpriseControllerTcpPose);
+                string handJson = null;
+                string bodyJson = null;
+                string motionJson = null;
                 long headSampleSeq = _lastDirectTrackingHeadSampleSeq;
                 long controllerSampleSeq = _lastDirectTrackingControllerSampleSeq;
+                long handSampleSeq = _lastDirectTrackingHandSampleSeq;
+                long bodySampleSeq = _lastDirectTrackingBodySampleSeq;
+                long motionSampleSeq = _lastDirectTrackingMotionSampleSeq;
                 bool hasNewTrackingSample = false;
 
                 LogEnterpriseDirectTrackingGateIfChanged();
@@ -463,11 +471,19 @@ namespace Robot
                             out headStatus,
                             out headSampleSeq))
                     {
-                        Thread.Sleep(GetClampedSleepMs(trackingThreadWaitForHeadSleepMs));
-                        continue;
+                        // Head requested but not ready yet: do not block Hand/Tracker-only sends.
+                        if (!TrackingData.ControllerOn &&
+                            !TrackingData.HandTrackingOn &&
+                            TrackingData.TrackingTypeValue <= TrackingData.TrackingType.None)
+                        {
+                            Thread.Sleep(GetClampedSleepMs(trackingThreadWaitForHeadSleepMs));
+                            continue;
+                        }
                     }
-
-                    hasNewTrackingSample |= headSampleSeq != _lastDirectTrackingHeadSampleSeq;
+                    else
+                    {
+                        hasNewTrackingSample |= headSampleSeq != _lastDirectTrackingHeadSampleSeq;
+                    }
                 }
 
                 if (TrackingData.ControllerOn)
@@ -485,6 +501,24 @@ namespace Robot
                     hasNewTrackingSample |= controllerSampleSeq != _lastDirectTrackingControllerSampleSeq;
                 }
 
+                if (TrackingData.HandTrackingOn &&
+                    EnterpriseAuxTrackingSampler.TryGetLatestHandJson(out handJson, out handSampleSeq))
+                {
+                    hasNewTrackingSample |= handSampleSeq != _lastDirectTrackingHandSampleSeq;
+                }
+
+                if (TrackingData.TrackingTypeValue == TrackingData.TrackingType.Body &&
+                    EnterpriseAuxTrackingSampler.TryGetLatestBodyJson(out bodyJson, out bodySampleSeq))
+                {
+                    hasNewTrackingSample |= bodySampleSeq != _lastDirectTrackingBodySampleSeq;
+                }
+
+                if (TrackingData.TrackingTypeValue == TrackingData.TrackingType.Motion &&
+                    EnterpriseAuxTrackingSampler.TryGetLatestMotionJson(out motionJson, out motionSampleSeq))
+                {
+                    hasNewTrackingSample |= motionSampleSeq != _lastDirectTrackingMotionSampleSeq;
+                }
+
                 if (!hasNewTrackingSample)
                 {
                     Interlocked.Increment(ref _directStaleReadCount);
@@ -496,7 +530,7 @@ namespace Robot
                 Interlocked.Increment(ref _directNewSampleCount);
 
                 JsonData trackingValue = new JsonData();
-                if (TrackingData.HeadOn)
+                if (TrackingData.HeadOn && !string.IsNullOrEmpty(headPose))
                 {
                     JsonData head = new JsonData();
                     head["pose"] = headPose;
@@ -521,6 +555,24 @@ namespace Robot
                     LogEnterpriseControllerPayloadIfNeeded(controller, controllerSampleSeq);
                 }
 
+                // Latest-only attach: Hand/Body/Motion failures never skip Head/Controller.
+                if (TrackingData.HandTrackingOn && !string.IsNullOrEmpty(handJson))
+                {
+                    trackingValue["Hand"] = JsonMapper.ToObject(handJson);
+                }
+
+                if (TrackingData.TrackingTypeValue == TrackingData.TrackingType.Body &&
+                    !string.IsNullOrEmpty(bodyJson))
+                {
+                    trackingValue["Body"] = JsonMapper.ToObject(bodyJson);
+                }
+
+                if (TrackingData.TrackingTypeValue == TrackingData.TrackingType.Motion &&
+                    !string.IsNullOrEmpty(motionJson))
+                {
+                    trackingValue["Motion"] = JsonMapper.ToObject(motionJson);
+                }
+
                 JsonData appState = new JsonData();
                 trackingValue["timeStampNs"] = Utils.GetCurrentTimestamp();
                 appState["focus"] = _cachedAppFocus;
@@ -539,6 +591,9 @@ namespace Robot
                 Interlocked.Increment(ref _pendingDirectTrackingPackets);
                 _lastDirectTrackingHeadSampleSeq = headSampleSeq;
                 _lastDirectTrackingControllerSampleSeq = controllerSampleSeq;
+                _lastDirectTrackingHandSampleSeq = handSampleSeq;
+                _lastDirectTrackingBodySampleSeq = bodySampleSeq;
+                _lastDirectTrackingMotionSampleSeq = motionSampleSeq;
 
                 LogDirectTrackingStatsIfNeeded(headSampleSeq, controllerSampleSeq);
             }
@@ -549,7 +604,10 @@ namespace Robot
             return SendTrackingData &&
                    EnterpriseDirectTrackingEnabled &&
                    TrackingDataSourceCtrl.UseEnterpriseSDK &&
-                   (TrackingData.HeadOn || TrackingData.ControllerOn);
+                   (TrackingData.HeadOn ||
+                    TrackingData.ControllerOn ||
+                    TrackingData.HandTrackingOn ||
+                    TrackingData.TrackingTypeValue > TrackingData.TrackingType.None);
         }
 
         private static JsonData BuildEnterpriseControllerJson(
@@ -721,6 +779,9 @@ namespace Robot
         {
             _lastDirectTrackingHeadSampleSeq = 0;
             _lastDirectTrackingControllerSampleSeq = 0;
+            _lastDirectTrackingHandSampleSeq = 0;
+            _lastDirectTrackingBodySampleSeq = 0;
+            _lastDirectTrackingMotionSampleSeq = 0;
         }
 
         private static int GetClampedSleepMs(int sleepMs)
@@ -807,7 +868,7 @@ namespace Robot
                         SocketError socketError = SocketError.Success;
                         if (_socket != null && _socket.Connected)
                         {
-                            //Sending general messages
+                            //Sending general messages (Head/Controller direct first)
                             while (_sendDatas.TryDequeue(out SendData sendData))
                             {
                                 if (sendData.IsDirectTracking)
@@ -939,6 +1000,7 @@ namespace Robot
 
             _state = SocketState.CLOSE;
             ResetDirectTrackingCache();
+            EnterpriseAuxTrackingSampler.ClearCaches();
             Interlocked.Exchange(ref _pendingDirectTrackingPackets, 0);
             lock (_sendObject)
             {

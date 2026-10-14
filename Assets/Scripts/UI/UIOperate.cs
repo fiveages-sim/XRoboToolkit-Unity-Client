@@ -76,7 +76,6 @@ public class UIOperate : MonoBehaviour
         NetshareTog.onValueChanged.AddListener(OnNetShareTog);
         HighAccuracy.onValueChanged.AddListener(OnHighAccuracy);
         ReconnectBtn.onClick.AddListener(OnReconnectBtn);
-        EnableCollectionStreams();
         MotionTrackerConnectionCache.EnsureSubscribed();
         //The shared network function is only available on B-end devices.
         NetshareTog.gameObject.SetActive(false);
@@ -261,16 +260,6 @@ public class UIOperate : MonoBehaviour
         }
 
         return false;
-    }
-
-    private void EnableCollectionStreams()
-    {
-        TrackingData.SetHeadOn(true);
-        TrackingData.SetControllerOn(true);
-        TcpHandler.SendTrackingData = true;
-        HeadTog.SetIsOnWithoutNotify(true);
-        ControllerTog.SetIsOnWithoutNotify(true);
-        SendTog.SetIsOnWithoutNotify(true);
     }
 
     private void EnsureUsbTcpConnected()
@@ -537,7 +526,6 @@ public class UIOperate : MonoBehaviour
     // Update is called once per frame
     void Update()
     {
-        EnableCollectionStreams();
         EnsureUsbTetheringEnabled();
         EnsureUsbTcpConnected();
 

@@ -38,6 +38,7 @@ namespace Robot
         [SerializeField] private bool collectHeadPose = true;
         [SerializeField] private bool collectControllerPose = true;
         [SerializeField] private int enterpriseSampleHz = 100;
+        private static int s_sharedEnterpriseSampleHz = 100;
         [SerializeField] private int unitySampleHz = 90;
         [SerializeField] private int maxRecordSeconds = 100;
         [SerializeField] private bool useDynamicPredictedDisplayTimeForEnterpriseHead = false;
@@ -74,6 +75,11 @@ namespace Robot
             GameObject recorder = new GameObject(nameof(EnterpriseCollectionRecorder));
             DontDestroyOnLoad(recorder);
             recorder.AddComponent<EnterpriseCollectionRecorder>();
+        }
+
+        private void Awake()
+        {
+            Volatile.Write(ref s_sharedEnterpriseSampleHz, Mathf.Clamp(enterpriseSampleHz, 0, 1000));
         }
 
         private void Start()
@@ -287,12 +293,14 @@ namespace Robot
                     continue;
                 }
 
-                if (collectHeadPose)
+                // Match UnityXR panel semantics: closed toggle means no sample and no send.
+                bool sendOn = TcpHandler.SendTrackingData;
+                if (collectHeadPose && sendOn && TrackingData.HeadOn)
                 {
                     Enqueue(EnterpriseHeadFile, BuildEnterpriseHeadLine());
                 }
 
-                if (collectControllerPose)
+                if (collectControllerPose && sendOn && TrackingData.ControllerOn)
                 {
                     Enqueue(EnterpriseControllerFile, BuildEnterpriseControllerLine());
                 }
@@ -327,10 +335,19 @@ namespace Robot
             get => Volatile.Read(ref enterpriseSampleHz);
         }
 
+        /// <summary>
+        /// Panel CollectionRate target Hz, readable from any thread (Hand/Tracker sampler).
+        /// </summary>
+        public static int SharedEnterpriseSampleHz
+        {
+            get => Volatile.Read(ref s_sharedEnterpriseSampleHz);
+        }
+
         public void SetEnterpriseSampleHz(int sampleHz)
         {
             int clampedSampleHz = Mathf.Clamp(sampleHz, 0, 1000);
             Volatile.Write(ref enterpriseSampleHz, clampedSampleHz);
+            Volatile.Write(ref s_sharedEnterpriseSampleHz, clampedSampleHz);
             Debug.Log($"{Tag} enterprise sample hz set to {clampedSampleHz}");
         }
 
