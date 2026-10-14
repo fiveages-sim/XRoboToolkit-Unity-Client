@@ -32,6 +32,12 @@ public class ResolutionDialog : MonoBehaviour
         heightInputField.text = ResolutionHeight.ToString();
         _confirm = call;
         _cancel = cancel;
+        if (widthInputField != null)
+        {
+            widthInputField.shouldHideMobileInput = false;
+            widthInputField.Select();
+            widthInputField.ActivateInputField();
+        }
     }
 
     public void OnConfirm()

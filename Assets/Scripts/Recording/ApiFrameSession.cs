@@ -210,9 +210,27 @@ namespace Robot
             _meta["openKeyEis"] = _enableEis ? PXRCapture.VALUE_TRUE : PXRCapture.VALUE_FALSE;
             _meta["openKeyMctf"] = _enableMctf ? PXRCapture.VALUE_TRUE : PXRCapture.VALUE_FALSE;
             _meta["openKeyMfnr"] = _enableMfnr ? PXRCapture.VALUE_TRUE : PXRCapture.VALUE_FALSE;
+            CaptureReport.WriteEncodeTimestampContract(_meta, "for4u-jpeg-frames",
+                "per_frame_sdk_boottime", _cameraMode, BufferWidth, BufferHeight, _requestedFps,
+                0, "jpeg", _enableEis, _enableMctf, _enableMfnr, _outputCameraRawData, CapturePathId);
             CaptureReport.WriteApiFramesPlan(_meta, BufferWidth, BufferHeight, _requestedFps, _cameraMode,
                 _framesDir, _framesJsonlPath, JpegQuality);
+            long estimated = CaptureReport.EstimateJpegSessionBytes(BufferWidth, BufferHeight, _requestedFps,
+                20 * 60);
+            long free;
+            long required;
+            string diskError;
+            bool diskOk = DiskSafety.EnsureSpace(VisionTrackingSession.DownloadDir, estimated, out free,
+                out required, out diskError);
+            CaptureReport.WriteDiskBudget(_meta, estimated, free, required, diskOk,
+                VisionTrackingSession.DownloadDir);
             WriteMeta();
+            if (!diskOk)
+            {
+                BeginFinish(diskError ?? "disk budget failed");
+                return;
+            }
+
             SetVisual("starting");
             SetStatus("API starting");
             string flags = "exp_Image=1 raw=" + (_outputCameraRawData ? 1 : 0) +
@@ -270,6 +288,26 @@ namespace Robot
                 _pendingFail = null;
                 BeginFinish(reason);
                 return;
+            }
+
+            if (_phase == RecordingSessionPhase.Recording && !_finalized && !_stopRequested)
+            {
+                _diskCheckTimer += Time.unscaledDeltaTime;
+                if (_diskCheckTimer >= 30f)
+                {
+                    _diskCheckTimer = 0f;
+                    long free = DiskSafety.GetFreeBytes(VisionTrackingSession.DownloadDir);
+                    if (_meta != null)
+                    {
+                        _meta["lastFreeBytes"] = free;
+                    }
+
+                    if (free >= 0 && free < DiskSafety.ReserveBytes)
+                    {
+                        BeginFinish("disk free below 2GB reserve");
+                        return;
+                    }
+                }
             }
 
             if (_acceptFrames && !_finalized && !_stopRequested)
@@ -378,6 +416,7 @@ namespace Robot
         }
 
         private int _pendingDropsBeforeWrite;
+        private float _diskCheckTimer;
 
         public void WriteTrackingSample()
         {
@@ -1017,6 +1056,7 @@ namespace Robot
             _meta["callbacks"] = _callbacks;
             _meta["framesDropped"] = _droppedFrames;
             _meta["throttledDrops"] = _throttledDrops;
+            CaptureReport.WriteDroppedFrames(_meta, _droppedFrames, 0, _throttledDrops);
             _meta["trackingSamples"] = _trackingSamples;
             _meta["requested_fps"] = _requestedFps;
             _meta["source_fps"] = _sourceFps.ToString("R", CultureInfo.InvariantCulture);

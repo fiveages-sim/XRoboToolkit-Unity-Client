@@ -134,6 +134,7 @@ namespace Robot
             _meta["mode"] = ModeName();
             _meta["imageCapturePath"] = vision ? "vision-capturelib" : "none";
             _meta["exp_Image"] = 0;
+            _meta["saveType"] = vision ? "vision-mp4" : "tracking-only";
             _meta["requestUtc"] = _requestUtc;
             _meta["width"] = width;
             _meta["height"] = height;
@@ -142,6 +143,25 @@ namespace Robot
             _meta["bitrate"] = bitrate;
             _meta["status"] = "starting";
             _meta["syncHint"] = SyncHint();
+            // AAR encoder is documented as ~5 Mbps; dialog bitrate may be ignored by capturelib.
+            int bitrateBps = bitrate > 0 ? bitrate : 5 * 1000 * 1000;
+            CaptureReport.WriteEncodeTimestampContract(_meta, "vision-startrecord",
+                "mp4_pts_plus_start_anchor", "3D", width, height, fps, bitrateBps, "avc",
+                eis: false, mctf: false, mfnr: false, raw: false,
+                capturePathId: vision ? "vision-capturelib" : "none");
+            CaptureReport.WriteMp4Plan(_meta, width, height, fps);
+            long estimated = CaptureReport.EstimateSurfaceMp4Bytes(bitrateBps, 20 * 60);
+            long free;
+            long required;
+            string diskError;
+            bool diskOk = DiskSafety.EnsureSpace(DownloadDir, estimated, out free, out required, out diskError);
+            CaptureReport.WriteDiskBudget(_meta, estimated, free, required, diskOk, DownloadDir);
+            if (vision && !diskOk)
+            {
+                Finish(RecordingSessionPhase.Failed, diskError ?? "disk budget failed", false);
+                return;
+            }
+
             WriteMeta();
 
             LogEvent("RecordRequested",
@@ -231,6 +251,8 @@ namespace Robot
             }
         }
 
+        private float _diskCheckTimer;
+
         public void Pump()
         {
             if (_pendingFail != null && !_finalized &&
@@ -240,6 +262,26 @@ namespace Robot
                 string reason = _pendingFail;
                 _pendingFail = null;
                 Finish(RecordingSessionPhase.Failed, reason, false);
+                return;
+            }
+
+            if (Phase == RecordingSessionPhase.Recording && !_finalized && _vision)
+            {
+                _diskCheckTimer += Time.unscaledDeltaTime;
+                if (_diskCheckTimer >= 30f)
+                {
+                    _diskCheckTimer = 0f;
+                    long free = DiskSafety.GetFreeBytes(DownloadDir);
+                    if (_meta != null)
+                    {
+                        _meta["lastFreeBytes"] = free;
+                    }
+
+                    if (free >= 0 && free < DiskSafety.ReserveBytes)
+                    {
+                        Finish(RecordingSessionPhase.FailedPartial, "disk free below 2GB reserve", false);
+                    }
+                }
             }
         }
 

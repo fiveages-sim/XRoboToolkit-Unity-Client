@@ -30,6 +30,20 @@ public class CameraSendInputDialog : MonoBehaviour
         TmpInput.text = PlayerPrefs.GetString("CameraSendInputDialog", "");
         OnConfirmCall = onConfirmCall;
         gameObject.SetActive(true);
+        // PICO/Android system keyboard only appears after focus; restored from main.
+        FocusInput(TmpInput);
+    }
+
+    private static void FocusInput(TMP_InputField field)
+    {
+        if (field == null)
+        {
+            return;
+        }
+
+        field.shouldHideMobileInput = false;
+        field.Select();
+        field.ActivateInputField();
     }
 
     private void OnConfirmBtn()

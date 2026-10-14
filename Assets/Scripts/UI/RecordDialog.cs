@@ -120,6 +120,8 @@ public class RecordDialog : MonoBehaviour
         {
             bitrateInputField.text = Bitrate.ToString();
         }
+
+        // Do not auto-open the system keyboard on Show; TMP fields open it when the user selects them.
     }
 
     public void OnConfirm()

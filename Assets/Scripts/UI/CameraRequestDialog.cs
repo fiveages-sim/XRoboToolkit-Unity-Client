@@ -105,6 +105,13 @@ public class CameraRequestDialog : MonoBehaviour
 
         _confirm = confirm;
         _cancel = cancel;
+        TMP_InputField focus = fpsInputField != null ? fpsInputField : bitrateInputField;
+        if (focus != null)
+        {
+            focus.shouldHideMobileInput = false;
+            focus.Select();
+            focus.ActivateInputField();
+        }
     }
 
 

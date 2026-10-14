@@ -47,7 +47,9 @@ public partial class UICameraCtrl : MonoBehaviour
 
     private readonly Robot.VisionTrackingSession _session = new Robot.VisionTrackingSession();
     private readonly Robot.ApiFrameSession _apiSession = new Robot.ApiFrameSession();
+    private readonly Robot.SurfaceEncodeProbe _surfaceProbe = new Robot.SurfaceEncodeProbe();
     private bool _useApiCapture;
+    private bool _useSurfaceProbe;
 
     private bool _recordTrackingData
     {
@@ -66,6 +68,14 @@ public partial class UICameraCtrl : MonoBehaviour
 
     private void Awake()
     {
+        // Leftover surface_probe_b0/b1 files used to hijack every Confirm into the encode probe.
+        Robot.SurfaceEncodeProbe.ClearLegacyMarkers();
+        if (Robot.SurfaceEncodeProbe.PrefsMode != Robot.SurfaceEncodeProbe.ModeOff)
+        {
+            Robot.SurfaceEncodeProbe.PrefsMode = Robot.SurfaceEncodeProbe.ModeOff;
+            LogWindow.Info("Surface encode probe PrefsMode cleared — Vision/for4U record path restored.");
+        }
+
         RecordBtn.OnChange += OnRecordBtn;
         TcpHandler.ReceiveFunctionEvent += OnNetReceive;
         CameraHandle.AddStateListener(OnCameraStateChanged);
@@ -329,6 +339,11 @@ public partial class UICameraCtrl : MonoBehaviour
             _session.RequestStop("object destroyed");
         }
 
+        if (_surfaceProbe.IsActive)
+        {
+            _surfaceProbe.RequestStop("object destroyed");
+        }
+
         if (_apiSession.IsActive)
         {
             _apiSession.RequestStop("object destroyed");
@@ -337,18 +352,26 @@ public partial class UICameraCtrl : MonoBehaviour
 
     private void OnRecordBtn(bool on)
     {
+        bool anyActive = _session.IsActive || _apiSession.IsActive || _surfaceProbe.IsActive;
+
+        // CustomButton toggles via Invoke(!On) but only SetVisual/SetOn updates On.
+        // If a probe left the button out of sync, a click may arrive as on=true while
+        // a session is already active — treat that as Stop, not a no-op.
+        if (anyActive)
+        {
+            StopRecord();
+            SetRecordVisual("stopping");
+            return;
+        }
+
         if (on)
         {
-            if (_session.IsActive || _apiSession.IsActive)
-            {
-                return;
-            }
-
             OpenRecord();
         }
         else
         {
-            StopRecord();
+            // Idle + off click: keep button visual reset.
+            SetRecordVisual("idle");
         }
     }
 
@@ -387,15 +410,43 @@ public partial class UICameraCtrl : MonoBehaviour
         bool expOutputRaw = false, bool expEnableEis = false, bool expEnableMctf = false,
         bool expEnableMfnr = true)
     {
+        // Surface probe is PrefsMode-only (see SurfaceEncodeProbe). Default path is Vision / for4U.
+        int probeMode = Robot.SurfaceEncodeProbe.ResolveMode();
+        _useSurfaceProbe = probeMode == Robot.SurfaceEncodeProbe.ModePatternB0 ||
+                           probeMode == Robot.SurfaceEncodeProbe.ModeCameraB1;
+        if (_useSurfaceProbe)
+        {
+            _useApiCapture = false;
+            LogWindow.Warn("SurfaceEncodeProbe PrefsMode=" + probeMode +
+                           " — skipping Vision/for4U. Set PrefsMode=0 for normal recording.");
+            SetRecordStatus(probeMode == Robot.SurfaceEncodeProbe.ModePatternB0
+                ? "B0 probe starting…"
+                : "B1 probe starting…");
+            if (probeMode == Robot.SurfaceEncodeProbe.ModePatternB0)
+            {
+                _surfaceProbe.BeginPattern(this, fps, onTrackingData);
+            }
+            else
+            {
+                _surfaceProbe.BeginCamera(this, fps, onTrackingData);
+            }
+
+            return;
+        }
+
         _useApiCapture = expImage == 1;
         if (_useApiCapture)
         {
             // Width/Height stay in the dialog for path A only. Path B uses the for4U buffer size.
+            LogWindow.Info("Starting for4U api-frames (exp_Image=1)");
+            SetRecordStatus("API frames starting…");
             _apiSession.Begin(this, fps, onTrackingData,
                 expOutputRaw, expEnableEis, expEnableMctf, expEnableMfnr);
             return;
         }
 
+        LogWindow.Info("Starting Vision StartRecord (exp_Image=0) " + width + "x" + height + "@" + fps);
+        SetRecordStatus("Vision starting…");
         _session.Begin(this, width, height, fps, bitrate, true, onTrackingData);
     }
 
@@ -427,13 +478,33 @@ public partial class UICameraCtrl : MonoBehaviour
 
     private void StopRecord()
     {
+        if (_surfaceProbe.IsActive)
+        {
+            _surfaceProbe.RequestStop("user");
+            // Coroutine gone but phase still active → hard reset so the button can recover.
+            if (_surfaceProbe.NeedsForceStop())
+            {
+                _surfaceProbe.ForceReset("user_stop");
+            }
+
+            _useSurfaceProbe = false;
+            return;
+        }
+
         if (_apiSession.IsActive)
         {
             _apiSession.RequestStop("user");
             return;
         }
 
-        _session.RequestStop("user");
+        if (_session.IsActive)
+        {
+            _session.RequestStop("user");
+            return;
+        }
+
+        _useSurfaceProbe = false;
+        SetRecordVisual("idle");
     }
 
     private void StopSendImage()
@@ -452,6 +523,12 @@ public partial class UICameraCtrl : MonoBehaviour
 
     private void Update()
     {
+        if (_useSurfaceProbe || _surfaceProbe.IsActive)
+        {
+            _surfaceProbe.Pump();
+            return;
+        }
+
         if (_useApiCapture || _apiSession.IsActive)
         {
             _apiSession.Pump();
@@ -475,6 +552,11 @@ public partial class UICameraCtrl : MonoBehaviour
         if (!pauseStatus)
         {
             return;
+        }
+
+        if (_surfaceProbe.IsActive)
+        {
+            _surfaceProbe.RequestStop("application paused");
         }
 
         if (_apiSession.IsActive)

@@ -273,6 +273,12 @@ namespace Robot
             sync["canAlign"] =
                 "Indirectly. videoStartElapsedRealtimeNs and videoStartPredictTimeUs are stored when StartRecord returns. " +
                 "Per-frame PTS is not exposed to C#. Do not subtract timeStampNs from PTS.";
+            sync["sdk_timestamp_ns"] = "absent";
+            sync["sdk_timestamp_ns_reason"] =
+                "Vision StartRecord does not expose Frame.timestamp; only encoder PTS and start anchors.";
+            sync["video_pts_us"] = "inside_mp4_mediacodec_pts";
+            sync["host_elapsedRealtimeNs_at_output"] =
+                "not_recorded_on_vision_path; do not confuse with capture time";
             return sync;
         }
 
@@ -282,6 +288,10 @@ namespace Robot
             sync["imageClock"] = "Frame.timestamp is exposure-start CLOCK_BOOTTIME nanoseconds.";
             sync["trackingClock"] =
                 "elapsedRealtimeNs is CLOCK_BOOTTIME nanoseconds. timeStampNs is UTC milliseconds times 1000000.";
+            sync["sdk_timestamp_ns"] = "per_frame_in_frames_jsonl";
+            sync["video_pts_us"] = "absent_until_pc_encode";
+            sync["host_elapsedRealtimeNs_at_output"] =
+                "not_applicable; jpeg writer uses accept-time elapsedRealtimeNs, not MediaCodec dequeue";
             if (!haveFrame)
             {
                 sync["canAlign"] = "No frame arrived, so no image timestamp was paired with tracking.";
@@ -294,6 +304,110 @@ namespace Robot
                 ? "Yes, as the same CLOCK_BOOTTIME family. Compare frames.jsonl sdk_timestamp_ns with tracking elapsedRealtimeNs. Do not subtract timeStampNs."
                 : "The first-frame delta is larger than 60 seconds, so the two timestamps are not treated as one clock.";
             return sync;
+        }
+
+        /// <summary>
+        /// Shared encode/timestamp contract for Vision, api-frames, and surface probe sessions.
+        /// </summary>
+        public static void WriteEncodeTimestampContract(JsonData meta, string encodePath,
+            string timestampStrategy, string eyeMode, int width, int height, int requestedFps,
+            int bitrateBps, string codec, bool eis, bool mctf, bool mfnr, bool raw,
+            string capturePathId)
+        {
+            if (meta == null)
+            {
+                return;
+            }
+
+            meta["encodePath"] = encodePath ?? "";
+            meta["timestampStrategy"] = timestampStrategy ?? "";
+            meta["eyeMode"] = eyeMode ?? "LEFT";
+            meta["width"] = width;
+            meta["height"] = height;
+            meta["requestedFps"] = requestedFps;
+            meta["requested_fps"] = requestedFps;
+            meta["bitrateBps"] = bitrateBps;
+            meta["codec"] = codec ?? "avc";
+            meta["eis"] = eis;
+            meta["mctf"] = mctf;
+            meta["mfnr"] = mfnr;
+            meta["raw"] = raw;
+            meta["capturePathId"] = capturePathId ?? "";
+
+            JsonData clocks = new JsonData();
+            clocks["sdk_timestamp_ns"] =
+                "SDK Frame.timestamp / capture mark (BOOTTIME ns). Absent on Vision StartRecord and typically on Surface preview.";
+            clocks["elapsedRealtimeNs"] =
+                "Device CLOCK_BOOTTIME ns. Use for tracking alignment.";
+            clocks["video_pts_us"] =
+                "MediaCodec/container presentationTimeUs. Not Unix and not BOOTTIME.";
+            clocks["host_elapsedRealtimeNs_at_output"] =
+                "Monotonic clock when the app dequeued an encoded sample. NOT capture time; includes queue/encode delay.";
+            meta["clockSemantics"] = clocks;
+
+            if (!meta.ContainsKey("dropped_frames") || meta["dropped_frames"] == null)
+            {
+                WriteDroppedFrames(meta, 0, 0, 0);
+            }
+        }
+
+        public static void WriteDroppedFrames(JsonData meta, int source, int encoder, int throttle)
+        {
+            if (meta == null)
+            {
+                return;
+            }
+
+            JsonData drops = new JsonData();
+            drops["source"] = source;
+            drops["encoder"] = encoder;
+            drops["throttle"] = throttle;
+            drops["note"] =
+                "source=camera/producer gaps; encoder=codec/muxer failures or output shortfalls; " +
+                "throttle=app-side intentional skips (saveFps / busy).";
+            meta["dropped_frames"] = drops;
+        }
+
+        public static long EstimateSurfaceMp4Bytes(int bitrateBps, double durationSec)
+        {
+            if (bitrateBps <= 0 || durationSec <= 0)
+            {
+                return 0;
+            }
+
+            return (long)(bitrateBps / 8.0 * durationSec * 1.15);
+        }
+
+        public static long EstimateJpegSessionBytes(int width, int height, int saveFps, double durationSec,
+            int approxJpegBytes = 400000)
+        {
+            if (saveFps <= 0 || durationSec <= 0)
+            {
+                return 0;
+            }
+
+            long perFrame = approxJpegBytes > 0
+                ? approxJpegBytes
+                : Math.Max(50000L, (long)width * height / 12);
+            return (long)(perFrame * saveFps * durationSec * 1.2);
+        }
+
+        public static void WriteDiskBudget(JsonData meta, long estimatedBytes, long freeBytes,
+            long requiredBytes, bool ok, string path)
+        {
+            if (meta == null)
+            {
+                return;
+            }
+
+            JsonData budget = new JsonData();
+            budget["path"] = path ?? "";
+            budget["estimatedBytes"] = estimatedBytes;
+            budget["freeBytes"] = freeBytes;
+            budget["requiredBytes"] = requiredBytes;
+            budget["ok"] = ok;
+            budget["rule"] = "free > 1.5 * estimatedBytes + 2GB";
+            meta["diskBudget"] = budget;
         }
 
         private static string MatrixText(Matrix4x4 matrix)

@@ -27,6 +27,12 @@ public class IpInputDialog : MonoBehaviour
         Remind.text = "";
         ConnectBtn.gameObject.SetActive(true);
         _connecting = false;
+        if (TmpInput != null)
+        {
+            TmpInput.shouldHideMobileInput = false;
+            TmpInput.Select();
+            TmpInput.ActivateInputField();
+        }
     }
 
     private void OnCloseBtn()
