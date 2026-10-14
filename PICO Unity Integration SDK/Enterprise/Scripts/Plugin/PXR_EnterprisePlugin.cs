@@ -2916,10 +2916,15 @@ namespace Unity.XR.PICO.TOBSupport
 
         public static bool StartPreview(IntPtr surfaceObj,PXRCaptureRenderMode mode)
         {
+            return StartPreview(surfaceObj, mode, 1024, 1024);
+        }
+
+        public static bool StartPreview(IntPtr surfaceObj, PXRCaptureRenderMode mode, int width, int height)
+        {
             bool value = false;
             if (Application.platform == RuntimePlatform.Android)
             {
-                value=startPreview(surfaceObj,(int)mode,1024,1024);
+                value = startPreview(surfaceObj, (int)mode, width, height);
             }
             return value;
         }

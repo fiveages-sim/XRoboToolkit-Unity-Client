@@ -10,9 +10,8 @@ using UnityEngine;
 namespace Robot
 {
     /// <summary>
-    /// Encode-path probe: B0 pattern→SurfaceVideoEncoder, B1 StartPreviewfor4U→encoder Surface.
-    /// Does not modify ApiFrameSession. Enable via PlayerPrefs SurfaceEncodeProbeMode=1|2
-    /// or call BeginPattern / BeginCamera directly.
+    /// for4U Surface → MediaCodec MP4 (production, exp_Image=1) and optional B0 pattern probe.
+    /// Production path: BeginCamera with panel eye/fps/flags. B0: PrefsMode=1 or surface_probe_b0.
     /// </summary>
     public sealed class SurfaceEncodeProbe
     {
@@ -23,6 +22,8 @@ namespace Robot
 
         public const int ProbeWidth = 1024;
         public const int ProbeHeight = 1024;
+        public const int DefaultWidth = ApiFrameSession.BufferWidth;
+        public const int DefaultHeight = ApiFrameSession.BufferHeight;
         public const int DefaultBitrateBps = 8 * 1000 * 1000;
         public const string EncodePathId = "for4u-surface-mediacodec";
 
@@ -45,7 +46,16 @@ namespace Robot
         private int _mode;
         private int _fps;
         private int _bitrateBps;
+        private int _width;
+        private int _height;
+        private string _eyeMode = "LEFT";
+        private bool _outputRaw;
+        private bool _enableEis;
+        private bool _enableMctf;
+        private bool _enableMfnr;
         private int _trackingSamples;
+        private long _trackingFirstElapsedRealtimeNs;
+        private long _trackingLastElapsedRealtimeNs;
         private long _videoStartElapsedRealtimeNs;
         private double _videoStartPredictTimeUs;
         private string _videoStartUtc;
@@ -86,16 +96,26 @@ namespace Robot
         }
 
         /// <summary>
-        /// Probe mode is PlayerPrefs-only so leftover Download marker files cannot hijack
-        /// Vision / for4U (exp_Image) recording. Enable explicitly:
-        /// SurfaceEncodeProbe.PrefsMode = 1 (B0) or 2 (B1); set 0 to disable.
+        /// Optional B0 pattern probe only (PrefsMode=1 or /sdcard/Download/surface_probe_b0).
+        /// Production Surface recording is exp_Image=1; B1 prefs/markers are ignored.
         /// </summary>
         public static int ResolveMode()
         {
-            int prefs = PrefsMode;
-            if (prefs == ModePatternB0 || prefs == ModeCameraB1)
+            if (PrefsMode == ModePatternB0)
             {
-                return prefs;
+                return ModePatternB0;
+            }
+
+            try
+            {
+                if (File.Exists(Path.Combine(VisionTrackingSession.DownloadDir, "surface_probe_b0")))
+                {
+                    return ModePatternB0;
+                }
+            }
+            catch (Exception exception)
+            {
+                Debug.LogWarning("[SurfaceEncodeProbe] marker check failed: " + exception.Message);
             }
 
             return ModeOff;
@@ -203,15 +223,21 @@ namespace Robot
 
         public void BeginPattern(UICameraCtrl host, int fps, bool tracking)
         {
-            Begin(host, ModePatternB0, fps, DefaultBitrateBps, tracking);
+            Begin(host, ModePatternB0, "LEFT", ProbeWidth, ProbeHeight, fps, DefaultBitrateBps,
+                tracking, false, false, false, false);
         }
 
-        public void BeginCamera(UICameraCtrl host, int fps, bool tracking)
+        public void BeginCamera(UICameraCtrl host, string eyeMode, int width, int height, int fps,
+            int bitrateBps, bool tracking, bool outputRaw, bool enableEis, bool enableMctf,
+            bool enableMfnr)
         {
-            Begin(host, ModeCameraB1, fps, DefaultBitrateBps, tracking);
+            Begin(host, ModeCameraB1, eyeMode, width, height, fps, bitrateBps, tracking,
+                outputRaw, enableEis, enableMctf, enableMfnr);
         }
 
-        public void Begin(UICameraCtrl host, int mode, int fps, int bitrateBps, bool tracking)
+        public void Begin(UICameraCtrl host, int mode, string eyeMode, int width, int height,
+            int fps, int bitrateBps, bool tracking, bool outputRaw, bool enableEis,
+            bool enableMctf, bool enableMfnr)
         {
             if (IsActive || host == null)
             {
@@ -220,20 +246,53 @@ namespace Robot
 
             if (mode != ModePatternB0 && mode != ModeCameraB1)
             {
-                Debug.LogError("[SurfaceEncodeProbe] mode must be 1 (B0) or 2 (B1)");
+                Debug.LogError("[SurfaceEncodeProbe] mode must be 1 (B0) or 2 (camera)");
                 return;
             }
 
             _host = host;
             _mode = mode;
-            _fps = Mathf.Clamp(fps, 1, 60);
+            _eyeMode = NormalizeEyeMode(eyeMode);
+            _width = width > 0 ? width : DefaultWidth;
+            _height = height > 0 ? height : DefaultHeight;
+            if (mode == ModePatternB0)
+            {
+                _width = ProbeWidth;
+                _height = ProbeHeight;
+                _eyeMode = "LEFT";
+                outputRaw = false;
+                enableEis = false;
+                enableMctf = false;
+                enableMfnr = false;
+            }
+
+            _fps = fps == 60 ? 60 : Mathf.Clamp(fps, 1, 60);
+            if (_fps != 30 && _fps != 60)
+            {
+                _fps = 30;
+            }
+
             _bitrateBps = bitrateBps > 0 ? bitrateBps : DefaultBitrateBps;
             _trackingEnabled = tracking;
+            _outputRaw = outputRaw;
+            _enableEis = enableEis;
+            _enableMctf = enableMctf;
+            _enableMfnr = enableMfnr;
+            if (_outputRaw && (_enableEis || _enableMctf || _enableMfnr))
+            {
+                _enableEis = false;
+                _enableMctf = false;
+                _enableMfnr = false;
+            }
+
             ReleaseJavaResources();
             _finalized = false;
             _stopRequested = false;
             _cameraOpen = false;
             _trackingSamples = 0;
+            _trackingFirstElapsedRealtimeNs = 0;
+            _trackingLastElapsedRealtimeNs = 0;
+            _lastDiskCheckMs = 0;
             _phase = RecordingSessionPhase.Starting;
             _sessionId = DateTime.Now.ToString("yyyyMMdd_HHmmss");
             string download = VisionTrackingSession.DownloadDir;
@@ -242,33 +301,44 @@ namespace Robot
                 _sessionId = _sessionId + "_" + DateTime.Now.ToString("fff");
             }
 
-            string prefix = mode == ModePatternB0 ? "surf_b0_" : "surf_b1_";
-            _videoPath = Path.Combine(download, prefix + "CameraRecord_" + _sessionId + ".mp4");
-            _frameMapPath = Path.Combine(download, prefix + "frame_map_" + _sessionId + ".jsonl");
+            string videoName = mode == ModePatternB0
+                ? "surf_b0_CameraRecord_" + _sessionId + ".mp4"
+                : "for4u_CameraRecord_" + _sessionId + ".mp4";
+            string mapName = mode == ModePatternB0
+                ? "surf_b0_frame_map_" + _sessionId + ".jsonl"
+                : "for4u_frame_map_" + _sessionId + ".jsonl";
+            _videoPath = Path.Combine(download, videoName);
+            _frameMapPath = Path.Combine(download, mapName);
             _metaPath = Path.Combine(download, "recording_meta_" + _sessionId + ".json");
             _trackingPath = Path.Combine(download, "trackingData_" + _sessionId + ".txt");
 
             _meta = new JsonData();
             _meta["sessionId"] = _sessionId;
-            _meta["exp_Image"] = -1;
-            _meta["saveType"] = "surface-encode-probe";
-            _meta["probePhase"] = mode == ModePatternB0 ? "B0-pattern" : "B1-camera";
+            _meta["exp_Image"] = mode == ModeCameraB1 ? 1 : -1;
+            _meta["saveType"] = mode == ModePatternB0 ? "surface-encode-probe" : "for4u-surface-mp4";
+            _meta["probePhase"] = mode == ModePatternB0 ? "B0-pattern" : "for4u-surface";
             _meta["status"] = "starting";
             _meta["requestUtc"] = DateTime.UtcNow.ToString("o");
             _meta["videoPath"] = _videoPath;
             _meta["frameMapPath"] = _frameMapPath;
             _meta["frameMapSemantics"] =
-                "video_pts_us=encoder PTS; host_elapsedRealtimeNs_at_output=dequeue time NOT capture; " +
-                "sdk_timestamp_ns absent unless separately proven.";
-
-            string strategy = mode == ModePatternB0
-                ? "mp4_pts_plus_start_anchor"
-                : "mp4_pts_plus_start_anchor";
-            CaptureReport.WriteEncodeTimestampContract(_meta, EncodePathId, strategy, "LEFT",
-                ProbeWidth, ProbeHeight, _fps, _bitrateBps, "avc",
-                eis: false, mctf: false, mfnr: false, raw: false, capturePathId: EncodePathId);
+                "t_video_ns = video_pts_us * 1000. Compare to tracking elapsedRealtimeNs. " +
+                "host_elapsedRealtimeNs_at_output is dequeue time, not exposure.";
+            _meta["alignFormula"] = "t_video_ns = video_pts_us * 1000";
+            CaptureReport.WriteEncodeTimestampContract(_meta, EncodePathId,
+                "mp4_pts_boottime_family", _eyeMode, _width, _height, _fps, _bitrateBps, "avc",
+                _enableEis, _enableMctf, _enableMfnr, _outputRaw, EncodePathId);
             _meta["timestampStrategyNote"] =
-                "Surface path has no Frame.timestamp by default. Do not treat host_at_output as capture time.";
+                "video_pts_us shares the boottime family with elapsedRealtimeNs but is encoder PTS, " +
+                "not proven exposure time. Clock proximity alone does not complete exposure sync.";
+            _meta["requestedEyeMode"] = _eyeMode;
+            _meta["requestedWidth"] = _width;
+            _meta["requestedHeight"] = _height;
+            _meta["requestedFps"] = _fps;
+            _meta["outputCameraRawData"] = _outputRaw;
+            _meta["enableEis"] = _enableEis;
+            _meta["enableMctf"] = _enableMctf;
+            _meta["enableMfnr"] = _enableMfnr;
 
             long estimated = CaptureReport.EstimateSurfaceMp4Bytes(_bitrateBps, 20 * 60);
             long free;
@@ -289,6 +359,36 @@ namespace Robot
 #else
             Finish(RecordingSessionPhase.Failed, "SurfaceEncodeProbe requires Android device");
 #endif
+        }
+
+        private static string NormalizeEyeMode(string mode)
+        {
+            if (string.Equals(mode, "RIGHT", StringComparison.OrdinalIgnoreCase))
+            {
+                return "RIGHT";
+            }
+
+            if (string.Equals(mode, "3D", StringComparison.OrdinalIgnoreCase))
+            {
+                return "3D";
+            }
+
+            return "LEFT";
+        }
+
+        private static PXRCaptureRenderMode ParseRenderMode(string eyeMode)
+        {
+            if (eyeMode == "RIGHT")
+            {
+                return PXRCaptureRenderMode.PXRCapture_RenderMode_RIGHT;
+            }
+
+            if (eyeMode == "3D")
+            {
+                return PXRCaptureRenderMode.PXRCapture_RenderMode_3D;
+            }
+
+            return PXRCaptureRenderMode.PXRCapture_RenderMode_LEFT;
         }
 
         public void RequestStop(string reason)
@@ -313,21 +413,19 @@ namespace Robot
             }
 
             long now = (long)(Time.realtimeSinceStartup * 1000.0);
-            if (now - _lastDiskCheckMs < 30000)
+            if (now - _lastDiskCheckMs >= 30000)
             {
-                return;
-            }
+                _lastDiskCheckMs = now;
+                long free = DiskSafety.GetFreeBytes(VisionTrackingSession.DownloadDir);
+                if (_meta != null)
+                {
+                    _meta["lastFreeBytes"] = free;
+                }
 
-            _lastDiskCheckMs = now;
-            long free = DiskSafety.GetFreeBytes(VisionTrackingSession.DownloadDir);
-            if (_meta != null)
-            {
-                _meta["lastFreeBytes"] = free;
-            }
-
-            if (free >= 0 && free < DiskSafety.ReserveBytes)
-            {
-                RequestStop("disk free below 2GB reserve");
+                if (free >= 0 && free < DiskSafety.ReserveBytes)
+                {
+                    RequestStop("disk free below 2GB reserve");
+                }
             }
 
             if (_trackingEnabled && _trackingWriter != null && _phase == RecordingSessionPhase.Recording)
@@ -351,10 +449,17 @@ namespace Robot
                     _trackingJson = new JsonData();
                 }
 
+                long elapsed = Utils.GetElapsedRealtimeNs();
                 _trackingData.Get(ref _trackingJson);
-                _trackingJson["elapsedRealtimeNs"] = Utils.GetElapsedRealtimeNs();
+                _trackingJson["elapsedRealtimeNs"] = elapsed;
                 _trackingJson["sessionId"] = _sessionId;
                 _trackingWriter.WriteLine(_trackingJson.ToJson());
+                if (_trackingSamples == 0)
+                {
+                    _trackingFirstElapsedRealtimeNs = elapsed;
+                }
+
+                _trackingLastElapsedRealtimeNs = elapsed;
                 _trackingSamples++;
             }
             catch (Exception exception)
@@ -374,8 +479,8 @@ namespace Robot
             try
             {
                 _encoder = new AndroidJavaObject("com.xrobotoolkit.enterprise.SurfaceVideoEncoder");
-                startResult = _encoder.Call<int>("start", _videoPath, _frameMapPath, ProbeWidth,
-                    ProbeHeight, _fps, _bitrateBps);
+                startResult = _encoder.Call<int>("start", _videoPath, _frameMapPath, _width,
+                    _height, _fps, _bitrateBps);
             }
             catch (Exception exception)
             {
@@ -456,9 +561,15 @@ namespace Robot
                 _meta["status"] = "recording";
                 WriteMeta();
                 SetVisual("recording");
-                SetStatus(_mode == ModePatternB0 ? "B0 pattern recording" : "B1 camera surface recording");
-                LogWindow.Info("[SurfaceEncodeProbe] recording " + (_mode == ModePatternB0 ? "B0" : "B1") +
+                SetStatus(_mode == ModePatternB0 ? "B0 pattern recording" : "for4U Surface recording");
+                LogWindow.Info("[SurfaceEncodeProbe] recording " +
+                               (_mode == ModePatternB0 ? "B0" : "for4U Surface") +
+                               " " + _eyeMode + " " + _width + "x" + _height + "@" + _fps +
                                " session=" + _sessionId);
+                if (_trackingEnabled)
+                {
+                    WriteTrackingSample();
+                }
 
                 while (!_stopRequested && !_finalized)
                 {
@@ -493,7 +604,10 @@ namespace Robot
                 PXR_Enterprise.Configurefor4U(false, _fps);
                 var flags = new System.Collections.Generic.Dictionary<string, string>
                 {
-                    { PXRCapture.KEY_OUTPUT_CAMERA_RAW_DATA, PXRCapture.VALUE_FALSE },
+                    {
+                        PXRCapture.KEY_OUTPUT_CAMERA_RAW_DATA,
+                        _outputRaw ? PXRCapture.VALUE_TRUE : PXRCapture.VALUE_FALSE
+                    },
                 };
                 PXR_Enterprise.Configurefor4U(flags);
             }
@@ -510,9 +624,18 @@ namespace Robot
 
             var openFlags = new System.Collections.Generic.Dictionary<string, string>
             {
-                { PXRCapture.KEY_EIS, PXRCapture.VALUE_FALSE },
-                { PXRCapture.KEY_MCTF, PXRCapture.VALUE_FALSE },
-                { PXRCapture.KEY_MFNR, PXRCapture.VALUE_FALSE },
+                {
+                    PXRCapture.KEY_EIS,
+                    _enableEis ? PXRCapture.VALUE_TRUE : PXRCapture.VALUE_FALSE
+                },
+                {
+                    PXRCapture.KEY_MCTF,
+                    _enableMctf ? PXRCapture.VALUE_TRUE : PXRCapture.VALUE_FALSE
+                },
+                {
+                    PXRCapture.KEY_MFNR,
+                    _enableMfnr ? PXRCapture.VALUE_TRUE : PXRCapture.VALUE_FALSE
+                },
             };
 
             bool openDone = false;
@@ -608,8 +731,9 @@ namespace Robot
             }
 
             _meta["surfacePassMethod"] = surfaceMethod;
-            _meta["startPreviewPluginSize"] =
-                "1024x1024 hardcoded in PXR_EnterprisePlugin.StartPreview";
+            _meta["startPreviewPluginSize"] = _width + "x" + _height + " passed to native startPreview";
+            _meta["outputCameraRawData"] = _outputRaw;
+            _meta["previewEyeMode"] = _eyeMode;
             if (surfacePtr == IntPtr.Zero)
             {
                 _meta["previewFailReason"] = "no Surface ptr for StartPreviewfor4U";
@@ -618,10 +742,10 @@ namespace Robot
 
             bool previewOk = false;
             Exception previewEx = null;
+            PXRCaptureRenderMode renderMode = ParseRenderMode(_eyeMode);
             try
             {
-                previewOk = PXR_Enterprise.StartPreviewfor4U(surfacePtr,
-                    PXRCaptureRenderMode.PXRCapture_RenderMode_LEFT);
+                previewOk = PXR_Enterprise.StartPreviewfor4U(surfacePtr, renderMode, _width, _height);
             }
             catch (Exception exception)
             {
@@ -636,7 +760,7 @@ namespace Robot
 
             _meta["startPreviewfor4U"] = previewOk;
             _meta["frameCallbackExpected"] =
-                "StartPreviewfor4U Surface path typically has no Frame.timestamp callbacks.";
+                "StartPreviewfor4U Surface path has no Frame.timestamp; use video_pts_us * 1000.";
             WriteMeta();
             if (!previewOk)
             {
@@ -654,11 +778,20 @@ namespace Robot
         {
             try
             {
+                long headerElapsed = Utils.GetElapsedRealtimeNs();
                 _trackingWriter = new StreamWriter(_trackingPath, false);
-                _trackingWriter.WriteLine("{\"type\":\"header\",\"sessionId\":\"" + _sessionId +
-                                          "\",\"elapsedRealtimeNs\":" + Utils.GetElapsedRealtimeNs() +
-                                          ",\"encodePath\":\"" + EncodePathId + "\"}");
+                JsonData header = new JsonData();
+                header["type"] = "header";
+                header["sessionId"] = _sessionId;
+                header["elapsedRealtimeNs"] = headerElapsed;
+                header["encodePath"] = EncodePathId;
+                header["alignFormula"] = "t_video_ns = video_pts_us * 1000";
+                header["clockNote"] =
+                    "elapsedRealtimeNs is CLOCK_BOOTTIME. Align with video_pts_us * 1000; " +
+                    "PTS is encoder time in the same family, not proven exposure.";
+                _trackingWriter.WriteLine(header.ToJson());
                 _meta["trackingPath"] = _trackingPath;
+                _meta["trackingHeaderElapsedRealtimeNs"] = headerElapsed;
             }
             catch (Exception exception)
             {
@@ -729,7 +862,8 @@ namespace Robot
                         encoderDrops = (int)Math.Max(0, submitted - outputs);
                     }
 
-                    CaptureReport.WriteDroppedFrames(_meta, 0, encoderDrops, 0);
+                    CaptureReport.WriteDroppedFrames(_meta, CountPtsGaps(), encoderDrops, 0);
+                    WriteMeasuredTiming();
                     if (stopResult != 0)
                     {
                         phase = RecordingSessionPhase.FailedPartial;
@@ -760,21 +894,137 @@ namespace Robot
             }
 
             CaptureReport.WriteMp4Result(_meta, _videoPath);
+            _meta["eyeMode"] = _eyeMode;
+            _meta["width"] = _width;
+            _meta["height"] = _height;
+            _meta["requestedFps"] = _fps;
+            _meta["bitrateBps"] = _bitrateBps;
+            _meta["raw"] = _outputRaw;
+            _meta["eis"] = _enableEis;
+            _meta["mctf"] = _enableMctf;
+            _meta["mfnr"] = _enableMfnr;
             _meta["trackingSamples"] = _trackingSamples;
+            if (_trackingFirstElapsedRealtimeNs > 0)
+            {
+                _meta["trackingFirstElapsedRealtimeNs"] = _trackingFirstElapsedRealtimeNs;
+            }
+
+            if (_trackingLastElapsedRealtimeNs > 0)
+            {
+                _meta["trackingLastElapsedRealtimeNs"] = _trackingLastElapsedRealtimeNs;
+            }
+
+            WriteClockSemantics();
             _meta["completedUtc"] = DateTime.UtcNow.ToString("o");
             _meta["reason"] = reason ?? "";
             _meta["status"] = phase == RecordingSessionPhase.Completed ? "completed" :
                 phase == RecordingSessionPhase.FailedPartial ? "failed_partial" : "failed";
-            _meta["g1Hints"] =
-                "Check mp4 present, outputSampleCount vs duration*fps, muxerStopOk, non-black visual review.";
-            _meta["g2Hints"] =
-                "Compare frame_map video_pts_us + videoStartElapsedRealtimeNs to tracking elapsedRealtimeNs. " +
-                "host_elapsedRealtimeNs_at_output is NOT capture time. Without sdk_timestamp_ns this is indirect sync only.";
+            _meta["alignHint"] =
+                "t_video_ns = video_pts_us * 1000 vs tracking elapsedRealtimeNs. " +
+                "Same clock family does not prove exposure time.";
             WriteMeta();
             _phase = RecordingSessionPhase.Idle;
             SetVisual("idle");
             SetStatus(_meta["status"].ToString());
             LogWindow.Info("[SurfaceEncodeProbe] " + _meta["status"] + " " + reason + " session=" + _sessionId);
+        }
+
+        private int CountPtsGaps()
+        {
+            if (string.IsNullOrEmpty(_frameMapPath) || !File.Exists(_frameMapPath))
+            {
+                return 0;
+            }
+
+            try
+            {
+                long prev = -1;
+                int drops = 0;
+                long expectedUs = (long)(1e6 / Math.Max(1, _fps));
+                long threshold = (long)(expectedUs * 1.8);
+                foreach (string line in File.ReadLines(_frameMapPath))
+                {
+                    if (string.IsNullOrWhiteSpace(line))
+                    {
+                        continue;
+                    }
+
+                    JsonData row = JsonMapper.ToObject(line);
+                    if (row == null || !row.ContainsKey("video_pts_us"))
+                    {
+                        continue;
+                    }
+
+                    long pts = long.Parse(row["video_pts_us"].ToString(), CultureInfo.InvariantCulture);
+                    if (prev >= 0 && pts - prev > threshold)
+                    {
+                        drops++;
+                    }
+
+                    prev = pts;
+                }
+
+                return drops;
+            }
+            catch
+            {
+                return 0;
+            }
+        }
+
+        private void WriteMeasuredTiming()
+        {
+            if (_meta == null)
+            {
+                return;
+            }
+
+            long first = ReadMetaLong("firstPtsUs", -1);
+            long last = ReadMetaLong("lastPtsUs", -1);
+            long samples = ReadMetaLong("outputSampleCount", 0);
+            if (first >= 0 && last > first && samples > 1)
+            {
+                double spanSec = (last - first) / 1e6;
+                _meta["durationSec"] = spanSec.ToString("R", CultureInfo.InvariantCulture);
+                _meta["measuredFps"] = ((samples - 1) / spanSec).ToString("R", CultureInfo.InvariantCulture);
+            }
+            else if (_meta.ContainsKey("mp4") && _meta["mp4"] != null && _meta["mp4"].IsObject &&
+                     _meta["mp4"].ContainsKey("durationSec"))
+            {
+                _meta["durationSec"] = _meta["mp4"]["durationSec"];
+            }
+        }
+
+        private long ReadMetaLong(string key, long fallback)
+        {
+            if (_meta == null || !_meta.ContainsKey(key) || _meta[key] == null)
+            {
+                return fallback;
+            }
+
+            long value;
+            return long.TryParse(_meta[key].ToString(), NumberStyles.Integer,
+                CultureInfo.InvariantCulture, out value)
+                ? value
+                : fallback;
+        }
+
+        private void WriteClockSemantics()
+        {
+            JsonData clocks = new JsonData();
+            clocks["video_pts_us"] =
+                "MediaCodec presentationTimeUs. On this device family it tracks CLOCK_BOOTTIME in microseconds. " +
+                "Use t_video_ns = video_pts_us * 1000. Not proven exposure time.";
+            clocks["elapsedRealtimeNs"] =
+                "Device CLOCK_BOOTTIME nanoseconds for tracking samples.";
+            clocks["host_elapsedRealtimeNs_at_output"] =
+                "App dequeue time for an encoded sample. Includes encode delay; not capture time.";
+            clocks["sdk_timestamp_ns"] =
+                "Absent on StartPreviewfor4U Surface path.";
+            clocks["align"] =
+                "Compare video_pts_us * 1000 with tracking elapsedRealtimeNs. " +
+                "Clock agreement does not complete exposure sync research.";
+            _meta["clockSemantics"] = clocks;
         }
 
         private void WriteMeta()

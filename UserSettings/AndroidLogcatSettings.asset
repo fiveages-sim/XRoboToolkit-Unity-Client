@@ -3,7 +3,7 @@
     "m_SelectedProcess": {
         "deviceId": "PA9410MGL7110037G",
         "name": "com.xrobotoolkit.client",
-        "processId": 20619,
+        "processId": 7396,
         "exited": false
     },
     "m_SelectedPriority": 0,
@@ -48,6 +48,60 @@
             "deviceId": "PA9410MGL7110037G",
             "name": "com.xrobotoolkit.client",
             "processId": 20619,
+            "exited": false
+        },
+        {
+            "deviceId": "PA9410MGL7110037G",
+            "name": "com.xrobotoolkit.client",
+            "processId": 21399,
+            "exited": false
+        },
+        {
+            "deviceId": "PA9410MGL7110037G",
+            "name": "com.xrobotoolkit.client",
+            "processId": 13504,
+            "exited": false
+        },
+        {
+            "deviceId": "PA9410MGL7110037G",
+            "name": "com.xrobotoolkit.client",
+            "processId": 20005,
+            "exited": false
+        },
+        {
+            "deviceId": "PA9410MGL7110037G",
+            "name": "com.xrobotoolkit.client",
+            "processId": 20773,
+            "exited": false
+        },
+        {
+            "deviceId": "PA9410MGL7110037G",
+            "name": "com.xrobotoolkit.client",
+            "processId": 21408,
+            "exited": false
+        },
+        {
+            "deviceId": "PA9410MGL7110037G",
+            "name": "com.xrobotoolkit.client",
+            "processId": 23509,
+            "exited": false
+        },
+        {
+            "deviceId": "PA9410MGL7110037G",
+            "name": "com.xrobotoolkit.client",
+            "processId": 6316,
+            "exited": false
+        },
+        {
+            "deviceId": "PA9410MGL7110037G",
+            "name": "com.xrobotoolkit.client",
+            "processId": 6721,
+            "exited": false
+        },
+        {
+            "deviceId": "PA9410MGL7110037G",
+            "name": "com.xrobotoolkit.client",
+            "processId": 7396,
             "exited": false
         }
     ],

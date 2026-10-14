@@ -68,14 +68,6 @@ public partial class UICameraCtrl : MonoBehaviour
 
     private void Awake()
     {
-        // Leftover surface_probe_b0/b1 files used to hijack every Confirm into the encode probe.
-        Robot.SurfaceEncodeProbe.ClearLegacyMarkers();
-        if (Robot.SurfaceEncodeProbe.PrefsMode != Robot.SurfaceEncodeProbe.ModeOff)
-        {
-            Robot.SurfaceEncodeProbe.PrefsMode = Robot.SurfaceEncodeProbe.ModeOff;
-            LogWindow.Info("Surface encode probe PrefsMode cleared — Vision/for4U record path restored.");
-        }
-
         RecordBtn.OnChange += OnRecordBtn;
         TcpHandler.ReceiveFunctionEvent += OnNetReceive;
         CameraHandle.AddStateListener(OnCameraStateChanged);
@@ -392,7 +384,9 @@ public partial class UICameraCtrl : MonoBehaviour
                 StartRecord(RecordDialog.ResolutionWidth, RecordDialog.ResolutionHeight,
                     RecordDialog.Fps, RecordDialog.Bitrate, withTracking, RecordDialog.ExpImage,
                     RecordDialog.ExpOutputRaw, RecordDialog.ExpEnableEis,
-                    RecordDialog.ExpEnableMctf, RecordDialog.ExpEnableMfnr);
+                    RecordDialog.ExpEnableMctf, RecordDialog.ExpEnableMfnr,
+                    RecordDialog.ExpEyeMode, RecordDialog.ExpTargetFps,
+                    RecordDialog.ExpBufferWidth, RecordDialog.ExpBufferHeight);
             }, null);
         }
         else
@@ -408,43 +402,42 @@ public partial class UICameraCtrl : MonoBehaviour
     private void StartRecord(int width, int height, int fps, int bitrate,
         bool onTrackingData, int expImage = 0,
         bool expOutputRaw = false, bool expEnableEis = false, bool expEnableMctf = false,
-        bool expEnableMfnr = true)
+        bool expEnableMfnr = true, string eyeMode = "LEFT", int targetFps = 30,
+        int bufferWidth = 2048, int bufferHeight = 1536)
     {
-        // Surface probe is PrefsMode-only (see SurfaceEncodeProbe). Default path is Vision / for4U.
+        // Optional B0 pattern probe only. B1/production Surface is exp_Image=1.
         int probeMode = Robot.SurfaceEncodeProbe.ResolveMode();
-        _useSurfaceProbe = probeMode == Robot.SurfaceEncodeProbe.ModePatternB0 ||
-                           probeMode == Robot.SurfaceEncodeProbe.ModeCameraB1;
-        if (_useSurfaceProbe)
+        if (probeMode == Robot.SurfaceEncodeProbe.ModePatternB0)
+        {
+            _useSurfaceProbe = true;
+            _useApiCapture = false;
+            LogWindow.Warn("SurfaceEncodeProbe B0 pattern — skipping Vision/for4U.");
+            SetRecordStatus("B0 probe starting…");
+            _surfaceProbe.BeginPattern(this, fps, onTrackingData);
+            return;
+        }
+
+        _useSurfaceProbe = false;
+        if (expImage == 1)
         {
             _useApiCapture = false;
-            LogWindow.Warn("SurfaceEncodeProbe PrefsMode=" + probeMode +
-                           " — skipping Vision/for4U. Set PrefsMode=0 for normal recording.");
-            SetRecordStatus(probeMode == Robot.SurfaceEncodeProbe.ModePatternB0
-                ? "B0 probe starting…"
-                : "B1 probe starting…");
-            if (probeMode == Robot.SurfaceEncodeProbe.ModePatternB0)
-            {
-                _surfaceProbe.BeginPattern(this, fps, onTrackingData);
-            }
-            else
-            {
-                _surfaceProbe.BeginCamera(this, fps, onTrackingData);
-            }
-
+            _useSurfaceProbe = true;
+            int surfaceFps = targetFps == 60 ? 60 : 30;
+            int surfaceBitrate = bitrate > 0 ? bitrate : Robot.SurfaceEncodeProbe.DefaultBitrateBps;
+            LogWindow.Info("Starting for4U Surface encode (exp_Image=1) " + eyeMode + " " +
+                           bufferWidth + "x" + bufferHeight + "@" + surfaceFps +
+                           " raw=" + (expOutputRaw ? 1 : 0) +
+                           " eis=" + (expEnableEis ? 1 : 0) +
+                           " mctf=" + (expEnableMctf ? 1 : 0) +
+                           " mfnr=" + (expEnableMfnr ? 1 : 0));
+            SetRecordStatus("for4U Surface starting…");
+            _surfaceProbe.BeginCamera(this, eyeMode, bufferWidth, bufferHeight, surfaceFps,
+                surfaceBitrate, onTrackingData, expOutputRaw, expEnableEis, expEnableMctf,
+                expEnableMfnr);
             return;
         }
 
-        _useApiCapture = expImage == 1;
-        if (_useApiCapture)
-        {
-            // Width/Height stay in the dialog for path A only. Path B uses the for4U buffer size.
-            LogWindow.Info("Starting for4U api-frames (exp_Image=1)");
-            SetRecordStatus("API frames starting…");
-            _apiSession.Begin(this, fps, onTrackingData,
-                expOutputRaw, expEnableEis, expEnableMctf, expEnableMfnr);
-            return;
-        }
-
+        _useApiCapture = false;
         LogWindow.Info("Starting Vision StartRecord (exp_Image=0) " + width + "x" + height + "@" + fps);
         SetRecordStatus("Vision starting…");
         _session.Begin(this, width, height, fps, bitrate, true, onTrackingData);

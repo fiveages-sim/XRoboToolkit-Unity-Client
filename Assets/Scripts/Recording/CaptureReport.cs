@@ -340,7 +340,8 @@ namespace Robot
             clocks["elapsedRealtimeNs"] =
                 "Device CLOCK_BOOTTIME ns. Use for tracking alignment.";
             clocks["video_pts_us"] =
-                "MediaCodec/container presentationTimeUs. Not Unix and not BOOTTIME.";
+                "MediaCodec/container presentationTimeUs. On for4U Surface sessions align as pts_us*1000 " +
+                "with elapsedRealtimeNs (same boottime family); still not proven exposure time.";
             clocks["host_elapsedRealtimeNs_at_output"] =
                 "Monotonic clock when the app dequeued an encoded sample. NOT capture time; includes queue/encode delay.";
             meta["clockSemantics"] = clocks;

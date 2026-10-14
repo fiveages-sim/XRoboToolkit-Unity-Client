@@ -3838,6 +3838,16 @@ namespace Unity.XR.PICO.TOBSupport
         {
            return PXR_EnterprisePlugin.StartPreview(surfaceObj,mode);
         }
+
+        /// <summary>
+        /// Same preview as <see cref="StartPreviewfor4U(IntPtr, PXRCaptureRenderMode)"/>,
+        /// with the width and height forwarded to native startPreview.
+        /// The no-size overload still passes 1024×1024.
+        /// </summary>
+        public static bool StartPreviewfor4U(IntPtr surfaceObj, PXRCaptureRenderMode mode, int width, int height)
+        {
+            return PXR_EnterprisePlugin.StartPreview(surfaceObj, mode, width, height);
+        }
         private static Action<Frame> onImageAvailable;
         private static Action<bool> openCameraAsyncSuccess;
         static Frame pxrFrame;

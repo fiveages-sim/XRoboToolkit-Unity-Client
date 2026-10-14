@@ -18,6 +18,9 @@ public class RecordDialog : MonoBehaviour
     public Text expImageLabel;
     public Image expImageBackground;
 
+    public const int BufferWidth = 2048;
+    public const int BufferHeight = 1536;
+
     private Action _confirm;
     private Action _cancel;
     private int _draftExpImage;
@@ -25,8 +28,16 @@ public class RecordDialog : MonoBehaviour
     private bool _draftEnableEis;
     private bool _draftEnableMctf;
     private bool _draftEnableMfnr;
+    private string _draftEyeMode = "LEFT";
+    private int _draftTargetFps = 30;
     private bool _expUiReady;
     private FlagButton[] _flagButtons;
+    private Button _eyeModeButton;
+    private Image _eyeModeBackground;
+    private Text _eyeModeLabel;
+    private Button _targetFpsButton;
+    private Image _targetFpsBackground;
+    private Text _targetFpsLabel;
     private Sprite _sharedButtonSprite;
     private Image.Type _sharedButtonType = Image.Type.Sliced;
     private float _sharedPpu = 1f;
@@ -71,13 +82,29 @@ public class RecordDialog : MonoBehaviour
 
     public bool RecordTrackingData { get; private set; }
 
-    /// <summary>0 = existing Vision path, 1 = professional for4U API path. Applied only on Confirm.</summary>
+    /// <summary>0 = Vision StartRecord, 1 = for4U Surface MediaCodec. Applied only on Confirm.</summary>
     public int ExpImage { get; private set; }
 
     public bool ExpOutputRaw { get; private set; }
     public bool ExpEnableEis { get; private set; }
     public bool ExpEnableMctf { get; private set; }
     public bool ExpEnableMfnr { get; private set; }
+
+    /// <summary>LEFT, RIGHT, or 3D. Used when ExpImage == 1.</summary>
+    public string ExpEyeMode { get; private set; } = "LEFT";
+
+    /// <summary>Requested capture/encode fps for Surface path (30 or 60).</summary>
+    public int ExpTargetFps { get; private set; } = 30;
+
+    public int ExpBufferWidth
+    {
+        get { return BufferWidth; }
+    }
+
+    public int ExpBufferHeight
+    {
+        get { return BufferHeight; }
+    }
 
     private void Start()
     {
@@ -134,12 +161,16 @@ public class RecordDialog : MonoBehaviour
         RecordTrackingData = trackingDataTog != null && trackingDataTog.isOn;
         ExpImage = _draftExpImage;
         SaveFlagPrefs();
+        SaveSurfacePrefs();
         if (ExpImage == 1)
         {
             ExpOutputRaw = _draftOutputRaw;
             ExpEnableEis = _draftEnableEis;
             ExpEnableMctf = _draftEnableMctf;
             ExpEnableMfnr = _draftEnableMfnr;
+            ExpEyeMode = NormalizeEyeMode(_draftEyeMode);
+            ExpTargetFps = _draftTargetFps == 60 ? 60 : 30;
+            Fps = ExpTargetFps;
         }
         else
         {
@@ -147,6 +178,8 @@ public class RecordDialog : MonoBehaviour
             ExpEnableEis = false;
             ExpEnableMctf = false;
             ExpEnableMfnr = false;
+            ExpEyeMode = "LEFT";
+            ExpTargetFps = 30;
         }
 
         if (_confirm != null)
@@ -170,8 +203,10 @@ public class RecordDialog : MonoBehaviour
         _draftExpImage = 0;
         ExpImage = 0;
         LoadFlagPrefsIntoDraft();
+        LoadSurfacePrefsIntoDraft();
         ApplyExpImageVisual();
         ApplyFlagVisuals();
+        ApplySurfaceOptionVisuals();
     }
 
     private void LoadFlagPrefsIntoDraft()
@@ -190,6 +225,13 @@ public class RecordDialog : MonoBehaviour
         }
     }
 
+    private void LoadSurfacePrefsIntoDraft()
+    {
+        _draftEyeMode = NormalizeEyeMode(PlayerPrefs.GetString("RecordExpEyeMode", "LEFT"));
+        int fps = PlayerPrefs.GetInt("RecordExpTargetFps", 30);
+        _draftTargetFps = fps == 60 ? 60 : 30;
+    }
+
     private void SaveFlagPrefs()
     {
         PlayerPrefs.SetInt("RecordExpRaw", _draftOutputRaw ? 1 : 0);
@@ -198,11 +240,67 @@ public class RecordDialog : MonoBehaviour
         PlayerPrefs.SetInt("RecordExpMfnr", _draftEnableMfnr ? 1 : 0);
     }
 
+    private void SaveSurfacePrefs()
+    {
+        PlayerPrefs.SetString("RecordExpEyeMode", NormalizeEyeMode(_draftEyeMode));
+        PlayerPrefs.SetInt("RecordExpTargetFps", _draftTargetFps == 60 ? 60 : 30);
+    }
+
+    private static string NormalizeEyeMode(string mode)
+    {
+        if (string.Equals(mode, "RIGHT", StringComparison.OrdinalIgnoreCase))
+        {
+            return "RIGHT";
+        }
+
+        if (string.Equals(mode, "3D", StringComparison.OrdinalIgnoreCase))
+        {
+            return "3D";
+        }
+
+        return "LEFT";
+    }
+
     private void ToggleExpImage()
     {
         _draftExpImage = _draftExpImage == 0 ? 1 : 0;
         ApplyExpImageVisual();
         ApplyFlagVisuals();
+        ApplySurfaceOptionVisuals();
+    }
+
+    private void CycleEyeMode()
+    {
+        if (_draftExpImage != 1)
+        {
+            return;
+        }
+
+        if (_draftEyeMode == "LEFT")
+        {
+            _draftEyeMode = "RIGHT";
+        }
+        else if (_draftEyeMode == "RIGHT")
+        {
+            _draftEyeMode = "3D";
+        }
+        else
+        {
+            _draftEyeMode = "LEFT";
+        }
+
+        ApplySurfaceOptionVisuals();
+    }
+
+    private void CycleTargetFps()
+    {
+        if (_draftExpImage != 1)
+        {
+            return;
+        }
+
+        _draftTargetFps = _draftTargetFps == 30 ? 60 : 30;
+        ApplySurfaceOptionVisuals();
     }
 
     private void ApplyExpImageVisual()
@@ -229,6 +327,33 @@ public class RecordDialog : MonoBehaviour
 
             ApplyToggleVisual(flag.Button, flag.Background, flag.Text, flag.Label,
                 flag.GetDraft(), enabled);
+        }
+    }
+
+    private void ApplySurfaceOptionVisuals()
+    {
+        bool enabled = _draftExpImage == 1;
+        ApplyToggleVisual(_eyeModeButton, _eyeModeBackground, _eyeModeLabel,
+            "Eye " + NormalizeEyeMode(_draftEyeMode), enabled, enabled);
+        ApplyToggleVisual(_targetFpsButton, _targetFpsBackground, _targetFpsLabel,
+            "FPS " + (_draftTargetFps == 60 ? 60 : 30), enabled, enabled);
+        if (widthInputField != null)
+        {
+            widthInputField.interactable = !enabled;
+        }
+
+        if (heightInputField != null)
+        {
+            heightInputField.interactable = !enabled;
+        }
+
+        if (fpsInputField != null)
+        {
+            fpsInputField.interactable = !enabled;
+            if (enabled)
+            {
+                fpsInputField.text = (_draftTargetFps == 60 ? 60 : 30).ToString();
+            }
         }
     }
 
@@ -274,6 +399,7 @@ public class RecordDialog : MonoBehaviour
             LayoutExpRow();
             ApplyExpImageVisual();
             ApplyFlagVisuals();
+            ApplySurfaceOptionVisuals();
             return;
         }
 
@@ -348,9 +474,9 @@ public class RecordDialog : MonoBehaviour
         }
 
         RectTransform panelRect = panel as RectTransform;
-        if (panelRect != null && panelRect.sizeDelta.y < 250f)
+        if (panelRect != null && panelRect.sizeDelta.y < 290f)
         {
-            panelRect.sizeDelta = new Vector2(panelRect.sizeDelta.x, 250f);
+            panelRect.sizeDelta = new Vector2(panelRect.sizeDelta.x, 290f);
         }
 
         if (expImageButton == null || expImageBackground == null || expImageLabel == null)
@@ -364,10 +490,12 @@ public class RecordDialog : MonoBehaviour
         }
 
         EnsureFlagButtons(panel);
+        EnsureSurfaceOptionButtons(panel);
         LayoutExpRow();
         _expUiReady = true;
         ApplyExpImageVisual();
         ApplyFlagVisuals();
+        ApplySurfaceOptionVisuals();
     }
 
     private void CreateExpImageButton(Transform panel)
@@ -519,9 +647,69 @@ public class RecordDialog : MonoBehaviour
         return label;
     }
 
+    private void EnsureSurfaceOptionButtons(Transform panel)
+    {
+        if (_eyeModeButton == null)
+        {
+            CreateCycleButton(panel, "exp_EyeMode", out _eyeModeButton, out _eyeModeBackground,
+                out _eyeModeLabel, CycleEyeMode, 88f);
+        }
+        else
+        {
+            _eyeModeButton.onClick.RemoveListener(CycleEyeMode);
+            _eyeModeButton.onClick.AddListener(CycleEyeMode);
+        }
+
+        if (_targetFpsButton == null)
+        {
+            CreateCycleButton(panel, "exp_TargetFps", out _targetFpsButton, out _targetFpsBackground,
+                out _targetFpsLabel, CycleTargetFps, 72f);
+        }
+        else
+        {
+            _targetFpsButton.onClick.RemoveListener(CycleTargetFps);
+            _targetFpsButton.onClick.AddListener(CycleTargetFps);
+        }
+    }
+
+    private void CreateCycleButton(Transform panel, string name, out Button button, out Image background,
+        out Text label, UnityEngine.Events.UnityAction onClick, float width)
+    {
+        GameObject buttonObject = new GameObject(name, typeof(RectTransform), typeof(CanvasRenderer),
+            typeof(Image), typeof(Button));
+        buttonObject.transform.SetParent(panel, false);
+        buttonObject.layer = panel.gameObject.layer;
+
+        RectTransform buttonRect = buttonObject.GetComponent<RectTransform>();
+        buttonRect.anchorMin = new Vector2(0.5f, 0.5f);
+        buttonRect.anchorMax = new Vector2(0.5f, 0.5f);
+        buttonRect.pivot = new Vector2(0.5f, 0.5f);
+        buttonRect.sizeDelta = new Vector2(width, _confirmButtonSize.y);
+        buttonRect.localScale = Vector3.one;
+
+        background = buttonObject.GetComponent<Image>();
+        background.sprite = _sharedButtonSprite;
+        background.type = _sharedButtonType;
+        background.pixelsPerUnitMultiplier = _sharedPpu;
+        background.raycastTarget = true;
+        background.color = Color.white;
+
+        button = buttonObject.GetComponent<Button>();
+        button.transition = Selectable.Transition.ColorTint;
+        button.targetGraphic = background;
+        Navigation navigation = button.navigation;
+        navigation.mode = Navigation.Mode.None;
+        button.navigation = navigation;
+        button.onClick.RemoveListener(onClick);
+        button.onClick.AddListener(onClick);
+
+        label = CreateButtonLabel(buttonObject.transform, panel.gameObject.layer, 12);
+    }
+
     private void LayoutExpRow()
     {
         const float rowY = -26f;
+        const float optionRowY = -62f;
         const float gap = 6f;
         float expWidth = _confirmButtonSize.x;
         float flagWidth = 52f;
@@ -541,28 +729,55 @@ public class RecordDialog : MonoBehaviour
         }
 
         float x = startX + expWidth * 0.5f + gap + flagWidth * 0.5f;
-        if (_flagButtons == null)
+        if (_flagButtons != null)
         {
-            return;
+            for (int i = 0; i < _flagButtons.Length; i++)
+            {
+                FlagButton flag = _flagButtons[i];
+                if (flag == null || flag.Button == null)
+                {
+                    continue;
+                }
+
+                RectTransform rect = flag.Button.transform as RectTransform;
+                if (rect != null)
+                {
+                    rect.anchoredPosition = new Vector2(x, rowY);
+                    rect.sizeDelta = new Vector2(flagWidth, _confirmButtonSize.y);
+                }
+
+                flag.Button.transform.SetAsLastSibling();
+                x += flagWidth + gap;
+            }
         }
 
-        for (int i = 0; i < _flagButtons.Length; i++)
+        float eyeWidth = 88f;
+        float fpsWidth = 72f;
+        float optionTotal = eyeWidth + gap + fpsWidth;
+        float optionStart = -optionTotal * 0.5f + eyeWidth * 0.5f;
+        if (_eyeModeButton != null)
         {
-            FlagButton flag = _flagButtons[i];
-            if (flag == null || flag.Button == null)
+            RectTransform eyeRect = _eyeModeButton.transform as RectTransform;
+            if (eyeRect != null)
             {
-                continue;
+                eyeRect.anchoredPosition = new Vector2(optionStart, optionRowY);
+                eyeRect.sizeDelta = new Vector2(eyeWidth, _confirmButtonSize.y);
             }
 
-            RectTransform rect = flag.Button.transform as RectTransform;
-            if (rect != null)
+            _eyeModeButton.transform.SetAsLastSibling();
+        }
+
+        if (_targetFpsButton != null)
+        {
+            RectTransform fpsRect = _targetFpsButton.transform as RectTransform;
+            if (fpsRect != null)
             {
-                rect.anchoredPosition = new Vector2(x, rowY);
-                rect.sizeDelta = new Vector2(flagWidth, _confirmButtonSize.y);
+                fpsRect.anchoredPosition = new Vector2(optionStart + eyeWidth * 0.5f + gap + fpsWidth * 0.5f,
+                    optionRowY);
+                fpsRect.sizeDelta = new Vector2(fpsWidth, _confirmButtonSize.y);
             }
 
-            flag.Button.transform.SetAsLastSibling();
-            x += flagWidth + gap;
+            _targetFpsButton.transform.SetAsLastSibling();
         }
     }
 }
