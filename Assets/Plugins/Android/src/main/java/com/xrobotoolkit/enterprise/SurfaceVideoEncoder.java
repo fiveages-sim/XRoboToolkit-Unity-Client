@@ -61,6 +61,7 @@ public final class SurfaceVideoEncoder {
     private Thread drainThread;
     private Thread patternThread;
     private Thread cropThread;
+    private Thread startThread;
 
     private SurfaceTexture cameraSurfaceTexture;
     private Surface cameraSurface;
@@ -70,6 +71,12 @@ public final class SurfaceVideoEncoder {
     private final AtomicBoolean cropRun = new AtomicBoolean(false);
     private final AtomicBoolean cropFrameAvailable = new AtomicBoolean(false);
     private CountDownLatch cameraSurfaceReady;
+
+    /** 0=idle, 1=pending, 2=done (see asyncStartResult). */
+    private final AtomicInteger asyncStartPoll = new AtomicInteger(0);
+    private final AtomicInteger asyncStartResult = new AtomicInteger(0);
+    /** 0=idle, 1=pending, 2=ready, negative=error. */
+    private final AtomicInteger cameraSurfacePoll = new AtomicInteger(0);
 
     private int width;
     private int height;
@@ -219,6 +226,53 @@ public final class SurfaceVideoEncoder {
     }
 
     /**
+     * Non-blocking encoder start for Unity main thread. Poll with {@link #pollStartResult()}.
+     *
+     * @return 0 if work accepted, negative if already starting/busy
+     */
+    public int startAsync(String outputMp4Path, String frameMapJsonlPath, int width, int height,
+                          int fps, int bitrateBps) {
+        synchronized (lock) {
+            if (asyncStartPoll.get() == 1) {
+                return -1;
+            }
+            if (startThread != null && startThread.isAlive()) {
+                return -1;
+            }
+            asyncStartPoll.set(1);
+            asyncStartResult.set(0);
+            final String path = outputMp4Path;
+            final String map = frameMapJsonlPath;
+            final int w = width;
+            final int h = height;
+            final int f = fps;
+            final int br = bitrateBps;
+            startThread = new Thread(() -> {
+                int result = start(path, map, w, h, f, br);
+                asyncStartResult.set(result);
+                asyncStartPoll.set(2);
+            }, "SurfaceVideoEncoderStart");
+            startThread.setDaemon(true);
+            startThread.start();
+            return 0;
+        }
+    }
+
+    /**
+     * @return 1 still pending; 0 success; negative failure; -99 never started
+     */
+    public int pollStartResult() {
+        int poll = asyncStartPoll.get();
+        if (poll == 1) {
+            return 1;
+        }
+        if (poll == 2) {
+            return asyncStartResult.get();
+        }
+        return -99;
+    }
+
+    /**
      * @return 0 on success, negative on failure
      */
     public int start(String outputMp4Path, String frameMapJsonlPath, int width, int height,
@@ -229,6 +283,7 @@ public final class SurfaceVideoEncoder {
                 return -1;
             }
             releaseInternal(false);
+            cameraSurfacePoll.set(0);
             if (outputMp4Path == null || outputMp4Path.length() == 0 || width <= 0 || height <= 0) {
                 return -2;
             }
@@ -320,7 +375,10 @@ public final class SurfaceVideoEncoder {
 
     /**
      * Mono path: create a SBS-sized SurfaceTexture for StartPreviewfor4U.
-     * Must be called after start() while RECORDING. Blocks until GL surface is ready.
+     * Non-blocking — poll {@link #pollCameraSurface()} from Unity (yield) until ready.
+     * Must be called after start() while RECORDING.
+     *
+     * @return 0 if creation work accepted; negative on immediate failure
      */
     public int createCameraSurface(int previewW, int previewH) {
         synchronized (lock) {
@@ -328,6 +386,10 @@ public final class SurfaceVideoEncoder {
                 return -1;
             }
             if (cameraSurface != null) {
+                cameraSurfacePoll.set(2);
+                return 0;
+            }
+            if (cameraSurfacePoll.get() == 1) {
                 return 0;
             }
             if (previewW <= 0 || previewH <= 0) {
@@ -336,21 +398,39 @@ public final class SurfaceVideoEncoder {
             previewWidth = previewW;
             previewHeight = previewH;
             cameraSurfaceReady = new CountDownLatch(1);
+            cameraSurfacePoll.set(1);
             cropRun.set(false);
             cropThread = new Thread(this::eyeCropSetupAndWait, "SurfaceVideoEncoderEyeCrop");
             cropThread.setDaemon(true);
             cropThread.start();
+            return 0;
         }
-        try {
-            if (!cameraSurfaceReady.await(5, TimeUnit.SECONDS) || cameraSurface == null) {
-                lastError = appendError(lastError, "createCameraSurface timeout");
+    }
+
+    /**
+     * @return 1 pending; 0 ready; negative error
+     */
+    public int pollCameraSurface() {
+        int poll = cameraSurfacePoll.get();
+        if (poll == 1) {
+            if (cameraSurface != null) {
+                cameraSurfacePoll.set(2);
+                return 0;
+            }
+            Thread thread = cropThread;
+            if (thread != null && !thread.isAlive() && cameraSurface == null && poll == 1) {
+                cameraSurfacePoll.compareAndSet(1, -3);
                 return -3;
             }
-            return 0;
-        } catch (InterruptedException error) {
-            lastError = appendError(lastError, "createCameraSurface interrupted");
-            return -4;
+            return 1;
         }
+        if (poll == 2) {
+            return cameraSurface != null ? 0 : -3;
+        }
+        if (poll < 0) {
+            return poll;
+        }
+        return -99;
     }
 
     /**
@@ -408,6 +488,15 @@ public final class SurfaceVideoEncoder {
      * @return 0 completed, negative failed partial
      */
     public int stop(boolean stopPattern) {
+        // If startAsync is still running, wait briefly so we do not release under it.
+        Thread starter = startThread;
+        if (starter != null && starter.isAlive()) {
+            try {
+                starter.join(8000);
+            } catch (InterruptedException ignored) {
+            }
+        }
+
         synchronized (lock) {
             int current = state.get();
             if (current == STATE_IDLE || current == STATE_COMPLETED || current == STATE_FAILED_PARTIAL) {
@@ -420,6 +509,7 @@ public final class SurfaceVideoEncoder {
             stopPatternProducer();
         }
         stopEyeCropProducer();
+        cameraSurfacePoll.set(0);
 
         synchronized (lock) {
             noteState(STATE_DRAINING_ENCODER);
@@ -650,6 +740,7 @@ public final class SurfaceVideoEncoder {
             vertBuf = ByteBuffer.allocateDirect(4 * 4 * 4).order(ByteOrder.nativeOrder())
                     .asFloatBuffer();
 
+            cameraSurfacePoll.set(2);
             if (cameraSurfaceReady != null) {
                 cameraSurfaceReady.countDown();
             }
@@ -725,6 +816,7 @@ public final class SurfaceVideoEncoder {
             lastError = appendError(lastError, "eye-crop: " + error.getMessage());
             encoderErrors.incrementAndGet();
             Log.e(TAG, "eye-crop failed", error);
+            cameraSurfacePoll.set(-3);
             if (cameraSurfaceReady != null) {
                 cameraSurfaceReady.countDown();
             }
@@ -978,6 +1070,8 @@ public final class SurfaceVideoEncoder {
         }
         muxerStarted = false;
         videoTrackIndex = -1;
+        // asyncStartPoll is owned by startAsync until it publishes result (2).
+        cameraSurfacePoll.set(0);
         if (!keepState) {
             state.set(STATE_IDLE);
         }

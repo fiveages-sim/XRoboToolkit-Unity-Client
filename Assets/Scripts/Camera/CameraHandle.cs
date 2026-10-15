@@ -400,6 +400,91 @@ namespace Robot
             return result;
         }
 
+        /// <summary>
+        /// Non-blocking Vision teardown: StopPreview+CloseCamera on a Java worker.
+        /// Poll with <see cref="PollFinalizeCapture"/> then <see cref="TakeFinalizeCaptureResults"/>.
+        /// </summary>
+        public static int BeginFinalizeCaptureAsync()
+        {
+            _flags.Drive = false;
+            _pipelineEpoch++;
+            _callbackProxy.OnCameraOpened = null;
+            try
+            {
+                using (AndroidJavaClass opener = new AndroidJavaClass("com.xrobotoolkit.enterprise.CaptureOpener"))
+                {
+                    int accepted = opener.CallStatic<int>("beginFinalizeCaptureAsync", GetJavaObject());
+                    LogPipeline("BeginFinalizeCaptureAsync", "accepted=" + accepted);
+                    return accepted;
+                }
+            }
+            catch (Exception exception)
+            {
+                Debug.LogWarning("[PXRCapture] BeginFinalizeCaptureAsync failed: " + exception.Message);
+                return -3;
+            }
+        }
+
+        /// <summary>1=pending, 2=done, 0=idle.</summary>
+        public static int PollFinalizeCapture()
+        {
+            try
+            {
+                using (AndroidJavaClass opener = new AndroidJavaClass("com.xrobotoolkit.enterprise.CaptureOpener"))
+                {
+                    return opener.CallStatic<int>("pollFinalizeCapture");
+                }
+            }
+            catch
+            {
+                return 0;
+            }
+        }
+
+        /// <summary>
+        /// stopPreviewResult, closeCameraResult, markIdleOk(0/1). Resets Java poll to idle.
+        /// </summary>
+        public static int[] TakeFinalizeCaptureResults()
+        {
+            try
+            {
+                using (AndroidJavaClass opener = new AndroidJavaClass("com.xrobotoolkit.enterprise.CaptureOpener"))
+                {
+                    int[] results = opener.CallStatic<int[]>("takeFinalizeCaptureResults");
+                    OpenSucceeded = false;
+                    if (results != null && results.Length >= 2)
+                    {
+                        LogPipeline("TakeFinalizeCaptureResults",
+                            "stop=" + results[0] + " close=" + results[1]);
+                    }
+
+                    return results ?? new[] { -1, -1, 0 };
+                }
+            }
+            catch (Exception exception)
+            {
+                Debug.LogWarning("[PXRCapture] TakeFinalizeCaptureResults failed: " + exception.Message);
+                OpenSucceeded = false;
+                return new[] { -1, -1, 0 };
+            }
+        }
+
+        public static void ResetFinalizeCapture()
+        {
+            try
+            {
+                using (AndroidJavaClass opener = new AndroidJavaClass("com.xrobotoolkit.enterprise.CaptureOpener"))
+                {
+                    opener.CallStatic("resetFinalizeCapture");
+                }
+            }
+            catch
+            {
+            }
+
+            OpenSucceeded = false;
+        }
+
         public static string GetCameraExtrinsics()
         {
             return GetJavaObject().Call<string>("getCameraExtrinsics");

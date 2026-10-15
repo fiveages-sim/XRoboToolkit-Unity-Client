@@ -32,6 +32,7 @@ namespace Robot
         public const string DownloadDir = "/sdcard/Download";
         public const float StartTimeoutSeconds = 12f;
         public const float RecoveryDelaySeconds = 2f;
+        public const float StopTimeoutSeconds = 8f;
 
         public RecordingSessionPhase Phase { get; private set; } = RecordingSessionPhase.Idle;
         public bool TrackingWriteEnabled { get; set; }
@@ -39,10 +40,12 @@ namespace Robot
 
         private UICameraCtrl _host;
         private Coroutine _routine;
+        private Coroutine _stopRoutine;
         private bool _vision;
         private bool _tracking;
         private bool _acceptStart;
         private bool _finalized;
+        private float _stoppingSince = -1f;
         private bool _videoStarted;
         private bool _trackingStarted;
         private bool _recoveryUsed;
@@ -84,6 +87,71 @@ namespace Robot
             }
         }
 
+        /// <summary>Stopping longer than StopTimeoutSeconds (native hang / lost stop coroutine).</summary>
+        public bool NeedsForceStop()
+        {
+            if (Phase != RecordingSessionPhase.Stopping || _stoppingSince < 0f)
+            {
+                return false;
+            }
+
+            return Time.realtimeSinceStartup - _stoppingSince >= StopTimeoutSeconds;
+        }
+
+        public void ForceReset(string reason)
+        {
+            Debug.LogWarning("[VisionTrackingSession] ForceReset phase=" + Phase + " reason=" + reason);
+            try
+            {
+                if (_stopRoutine != null && _host != null)
+                {
+                    _host.StopCoroutine(_stopRoutine);
+                    _stopRoutine = null;
+                }
+
+                if (_routine != null && _host != null)
+                {
+                    _host.StopCoroutine(_routine);
+                    _routine = null;
+                }
+            }
+            catch
+            {
+            }
+
+#if UNITY_ANDROID && !UNITY_EDITOR
+            try
+            {
+                CameraHandle.ResetFinalizeCapture();
+            }
+            catch
+            {
+            }
+#endif
+            TrackingWriteEnabled = false;
+            CloseTrackingWriter();
+            _acceptStart = false;
+            _finalized = true;
+            _stoppingSince = -1f;
+            Phase = RecordingSessionPhase.Idle;
+            if (_meta != null)
+            {
+                _meta["forceResetReason"] = reason ?? "";
+                _meta["status"] = "failed";
+                try
+                {
+                    WriteMeta();
+                }
+                catch
+                {
+                }
+            }
+
+            SetVisual("idle");
+            SetStatus("Failed");
+            _finalized = false;
+        }
+
         public void Begin(UICameraCtrl host, int width, int height, int fps, int bitrate, bool vision, bool tracking)
         {
             if (IsActive)
@@ -100,6 +168,8 @@ namespace Robot
             _fps = fps;
             _bitrate = bitrate;
             _finalized = false;
+            _stoppingSince = -1f;
+            _stopRoutine = null;
             _acceptStart = false;
             _videoStarted = false;
             _trackingStarted = false;
@@ -184,7 +254,18 @@ namespace Robot
 
         public void RequestStop(string reason)
         {
-            if (_finalized || Phase == RecordingSessionPhase.Idle || Phase == RecordingSessionPhase.Stopping)
+            if (Phase == RecordingSessionPhase.Idle)
+            {
+                return;
+            }
+
+            if (Phase == RecordingSessionPhase.Stopping)
+            {
+                ForceReset("stop_reentry:" + (reason ?? "user"));
+                return;
+            }
+
+            if (_finalized || _stopRoutine != null)
             {
                 return;
             }
@@ -193,14 +274,25 @@ namespace Robot
             _meta["stopRequestUtc"] = _stopUtc;
             _meta["stopReason"] = reason;
             LogEvent("StopRequested", "reason=" + reason + " phase=" + Phase, false);
-            bool streamsStarted = Phase == RecordingSessionPhase.Recording || _videoStarted || _trackingStarted;
-            if (!streamsStarted)
+            bool streamsStarted = Phase == RecordingSessionPhase.Recording
+                                  || Phase == RecordingSessionPhase.CameraReady
+                                  || _videoStarted
+                                  || _trackingStarted
+                                  || CameraHandle.PreviewEverStarted;
+            RecordingSessionPhase requested = streamsStarted
+                ? RecordingSessionPhase.Completed
+                : RecordingSessionPhase.Failed;
+            string finishReason = streamsStarted
+                ? reason
+                : "stopped during startup: " + reason;
+            if (_host != null)
             {
-                Finish(RecordingSessionPhase.Failed, "stopped during startup: " + reason, true);
-                return;
+                _stopRoutine = _host.StartCoroutine(StopAndFinish(requested, finishReason, true));
             }
-
-            Finish(RecordingSessionPhase.Completed, reason, true);
+            else
+            {
+                Finish(requested, finishReason, true);
+            }
         }
 
         public void WriteTrackingSample()
@@ -255,6 +347,12 @@ namespace Robot
 
         public void Pump()
         {
+            if (NeedsForceStop())
+            {
+                ForceReset("stopping_timeout");
+                return;
+            }
+
             if (_pendingFail != null && !_finalized &&
                 (Phase == RecordingSessionPhase.Starting || Phase == RecordingSessionPhase.CameraReady ||
                  Phase == RecordingSessionPhase.Recording))
@@ -623,16 +721,41 @@ namespace Robot
 
         private void Finish(RecordingSessionPhase requestedPhase, string reason, bool fromUserStop)
         {
-            if (_finalized)
+            if (_finalized || _stopRoutine != null)
             {
                 return;
+            }
+
+            if (_host != null)
+            {
+                _stopRoutine = _host.StartCoroutine(StopAndFinish(requestedPhase, reason, fromUserStop));
+                return;
+            }
+
+            // No host: best-effort synchronous path (editor / teardown).
+            _finalized = true;
+            Phase = RecordingSessionPhase.Stopping;
+            SetVisual("stopping");
+            bool cleanupFailed = SyncNativeTeardown();
+            CompleteFinish(requestedPhase, reason, fromUserStop, cleanupFailed);
+        }
+
+        private IEnumerator StopAndFinish(RecordingSessionPhase requestedPhase, string reason,
+            bool fromUserStop)
+        {
+            if (_finalized)
+            {
+                _stopRoutine = null;
+                yield break;
             }
 
             _finalized = true;
             _acceptStart = false;
             TrackingWriteEnabled = false;
             Phase = RecordingSessionPhase.Stopping;
+            _stoppingSince = Time.realtimeSinceStartup;
             SetVisual("stopping");
+            SetStatus("Stopping…");
             if (string.IsNullOrEmpty(_stopUtc))
             {
                 _stopUtc = DateTime.UtcNow.ToString("o");
@@ -640,32 +763,118 @@ namespace Robot
             }
 
             CameraHandle.RemoveErrorListener(OnCaptureError);
-            bool previewStarted = CameraHandle.PreviewEverStarted;
-            bool openSucceeded = CameraHandle.OpenSucceeded;
             CameraHandle.StopDrivingPipeline();
-
             CloseTrackingWriter();
 
             bool cleanupFailed = false;
-            if (_vision && previewStarted)
+            bool previewStarted = CameraHandle.PreviewEverStarted;
+            bool openSucceeded = CameraHandle.OpenSucceeded;
+
+            if (_vision && (previewStarted || openSucceeded))
             {
                 LogEvent("VideoFinalizeStarted", "path=" + _videoPath, false);
+                yield return FinalizeVisionNativeAsync();
+                if (_meta != null && _meta.ContainsKey("finalizeTimedOut"))
+                {
+                    cleanupFailed = true;
+                    requestedPhase = RecordingSessionPhase.FailedPartial;
+                }
+
+                if (_meta != null && _meta.ContainsKey("stopPreviewError"))
+                {
+                    cleanupFailed = true;
+                }
+            }
+
+            CompleteFinish(requestedPhase, reason, fromUserStop, cleanupFailed);
+            _stopRoutine = null;
+            _stoppingSince = -1f;
+        }
+
+        private IEnumerator FinalizeVisionNativeAsync()
+        {
+#if UNITY_ANDROID && !UNITY_EDITOR
+            int accepted = -99;
+            Exception beginEx = null;
+            try
+            {
+                accepted = CameraHandle.BeginFinalizeCaptureAsync();
+            }
+            catch (Exception exception)
+            {
+                beginEx = exception;
+            }
+
+            if (beginEx != null)
+            {
+                _meta["stopPreviewError"] = beginEx.Message;
+                SyncNativeTeardown();
+                yield break;
+            }
+
+            // -1 = already running; still poll. Other negatives → sync fallback.
+            if (accepted != 0 && accepted != -1)
+            {
+                _meta["finalizeAsyncAccepted"] = accepted;
+                SyncNativeTeardown();
+                yield break;
+            }
+
+            _meta["finalizeAsyncAccepted"] = accepted;
+            while (CameraHandle.PollFinalizeCapture() == 1)
+            {
+                if (Time.realtimeSinceStartup - _stoppingSince >= StopTimeoutSeconds)
+                {
+                    _meta["finalizeTimedOut"] = true;
+                    _meta["startTimeoutSec"] = StopTimeoutSeconds;
+                    CameraHandle.ResetFinalizeCapture();
+                    LogEvent("VideoFinalizeCompleted", "timed out after " + StopTimeoutSeconds + "s", true);
+                    yield break;
+                }
+
+                yield return null;
+            }
+
+            if (CameraHandle.PollFinalizeCapture() == 2)
+            {
+                int[] results = CameraHandle.TakeFinalizeCaptureResults();
+                if (results != null && results.Length >= 2)
+                {
+                    _meta["stopPreviewResult"] = results[0];
+                    _meta["closeCameraResult"] = results[1];
+                    if (results.Length >= 3)
+                    {
+                        _meta["markUseStateIdleOk"] = results[2] == 1;
+                    }
+
+                    LogEvent("VideoFinalizeCompleted",
+                        "stopPreviewResult=" + results[0] + " closeCameraResult=" + results[1], false);
+                }
+            }
+#else
+            SyncNativeTeardown();
+            yield break;
+#endif
+        }
+
+        private bool SyncNativeTeardown()
+        {
+            bool cleanupFailed = false;
+            if (_vision && CameraHandle.PreviewEverStarted)
+            {
                 try
                 {
                     int stopPreview = CameraHandle.StopPreview();
                     _meta["stopPreviewResult"] = stopPreview;
-                    LogEvent("VideoFinalizeCompleted", "stopPreviewResult=" + stopPreview, false);
                 }
                 catch (Exception exception)
                 {
                     cleanupFailed = true;
                     _meta["stopPreviewError"] = exception.Message;
-                    LogEvent("VideoFinalizeCompleted", "exception=" + exception.Message, true);
-                    requestedPhase = RecordingSessionPhase.FailedPartial;
                 }
             }
 
-            if (_vision && openSucceeded)
+            if (_vision && CameraHandle.OpenSucceeded)
             {
                 try
                 {
@@ -676,12 +885,17 @@ namespace Robot
                 {
                     cleanupFailed = true;
                     _meta["closeCameraError"] = exception.Message;
-                    LogEvent("SessionFailed", "CloseCamera exception=" + exception.Message, true);
                 }
             }
 
+            return cleanupFailed;
+        }
+
+        private void CompleteFinish(RecordingSessionPhase requestedPhase, string reason, bool fromUserStop,
+            bool cleanupFailed)
+        {
             string validationError = ValidateFiles();
-            bool anyStreamStarted = _videoStarted || _trackingStarted;
+            bool anyStreamStarted = _videoStarted || _trackingStarted || CameraHandle.PreviewEverStarted;
             bool cleanStop = fromUserStop && !cleanupFailed &&
                              requestedPhase != RecordingSessionPhase.FailedPartial;
             RecordingSessionPhase finalPhase;
@@ -709,7 +923,6 @@ namespace Robot
             _meta["videoBytes"] = FileLength(_videoPath);
             _meta["trackingBytes"] = FileLength(_trackingPath);
             WriteMeta();
-            // Leave Stopping so IsActive becomes false immediately; keep final status in meta.
             Phase = RecordingSessionPhase.Idle;
 
             string summary = "status=" + _meta["status"] + " reason=" + reason +

@@ -253,7 +253,7 @@ namespace Robot
 
         public void BeginCamera(UICameraCtrl host, string eyeMode, int width, int height, int fps,
             int bitrateBps, bool tracking, bool outputRaw, bool enableEis, bool enableMctf,
-            bool enableMfnr, int previewWidth = SbsWidth, int previewHeight = EyeHeight)
+            bool enableMfnr, int previewWidth = EyeWidth, int previewHeight = EyeHeight)
         {
             Begin(host, ModeCameraB1, eyeMode, width, height, previewWidth, previewHeight, fps,
                 bitrateBps, tracking, outputRaw, enableEis, enableMctf, enableMfnr);
@@ -284,9 +284,20 @@ namespace Robot
                 RecordDialog.ResolveEncodeSize(_eyeMode, out encodeW, out encodeH);
                 _width = encodeW;
                 _height = encodeH;
-                _previewWidth = previewWidth > 0 ? previewWidth : SbsWidth;
-                _previewHeight = previewHeight > 0 ? previewHeight : EyeHeight;
-                _useEyeCrop = _eyeMode != "3D";
+                // Mono and 3D both use direct encode Surface at encode size.
+                // Legacy eye-crop (4096 SBS + GLES half) over-cropped mono vs 3D left eye.
+                int previewW;
+                int previewH;
+                RecordDialog.ResolvePreviewSize(_eyeMode, out previewW, out previewH);
+                _previewWidth = previewWidth > 0 ? previewWidth : previewW;
+                _previewHeight = previewHeight > 0 ? previewHeight : previewH;
+                if (_previewWidth != _width || _previewHeight != _height)
+                {
+                    _previewWidth = _width;
+                    _previewHeight = _height;
+                }
+
+                _useEyeCrop = false;
             }
             else
             {
@@ -378,19 +389,15 @@ namespace Robot
             _meta["surfacePath"] = _useEyeCrop ? "eye-crop" : "direct";
             _meta["cropHalf"] = !_useEyeCrop ? "none" :
                 (_eyeMode == "RIGHT" ? "right" : "left");
-            if (_useEyeCrop)
-            {
-                _meta["layout"] = _eyeMode + " SBS half cropped to full " + _width + "x" + _height +
-                                  " (4:3)";
-            }
-            else if (_eyeMode == "3D")
+            if (_eyeMode == "3D")
             {
                 _meta["layout"] = "3D SBS " + _width + "x" + _height +
-                                  " (8:3, each eye 4:3)";
+                                  " (8:3, each eye 4:3); direct Surface";
             }
             else
             {
-                _meta["layout"] = _eyeMode + " " + _width + "x" + _height;
+                _meta["layout"] = _eyeMode + " full-eye " + _width + "x" + _height +
+                                  " (4:3); direct StartPreview (no SBS half-crop)";
             }
 
             _meta["requestedFps"] = _fps;
@@ -549,6 +556,17 @@ namespace Robot
             }
         }
 
+        private void SetStartPhase(string phase)
+        {
+            if (_meta == null)
+            {
+                return;
+            }
+
+            _meta["startPhase"] = phase ?? "";
+            WriteMeta();
+        }
+
 #if UNITY_ANDROID && !UNITY_EDITOR
         private IEnumerator Run()
         {
@@ -557,12 +575,15 @@ namespace Robot
             // Cooperative start budget (Pump also ForceResets at StartTimeoutSeconds).
             float startDeadline = _startedRealtime + StartTimeoutSeconds;
 
-            int startResult = -99;
+            SetStartPhase("encoder_async");
+            int startResult = 1; // 1=pending sentinel until poll completes
             Exception startEx = null;
+            int accepted = -99;
+            // Iterators cannot yield inside try/catch — keep Call and yield separated.
             try
             {
                 _encoder = new AndroidJavaObject("com.xrobotoolkit.enterprise.SurfaceVideoEncoder");
-                startResult = _encoder.Call<int>("start", _videoPath, _frameMapPath, _width,
+                accepted = _encoder.Call<int>("startAsync", _videoPath, _frameMapPath, _width,
                     _height, _fps, _bitrateBps);
             }
             catch (Exception exception)
@@ -570,11 +591,55 @@ namespace Robot
                 startEx = exception;
             }
 
-            if (startEx != null)
+            if (startEx == null && accepted != 0)
+            {
+                startResult = accepted;
+            }
+            else if (startEx == null)
+            {
+                while (!_finalized && !_stopRequested && Time.realtimeSinceStartup < startDeadline)
+                {
+                    int poll = 1;
+                    Exception pollEx = null;
+                    try
+                    {
+                        poll = _encoder.Call<int>("pollStartResult");
+                    }
+                    catch (Exception exception)
+                    {
+                        pollEx = exception;
+                    }
+
+                    if (pollEx != null)
+                    {
+                        startEx = pollEx;
+                        break;
+                    }
+
+                    if (poll == 1)
+                    {
+                        yield return null;
+                        continue;
+                    }
+
+                    startResult = poll;
+                    break;
+                }
+            }
+
+            if (failReason == null && startEx != null)
             {
                 failReason = "encoder start exception: " + startEx.Message;
             }
-            else if (startResult != 0)
+            else if (failReason == null && startResult == 1)
+            {
+                failReason = "encoder startAsync timeout";
+                if (_meta != null)
+                {
+                    _meta["startTimeoutSec"] = StartTimeoutSeconds;
+                }
+            }
+            else if (failReason == null && startResult != 0)
             {
                 failReason = "encoder start returned " + startResult +
                              " (rebuild APK if class SurfaceVideoEncoder missing)";
@@ -582,6 +647,7 @@ namespace Robot
 
             if (failReason == null)
             {
+                SetStartPhase("encoder_ready");
                 _videoStartUtc = DateTime.UtcNow.ToString("o");
                 _videoStartElapsedRealtimeNs = Utils.GetElapsedRealtimeNs();
                 try
@@ -601,6 +667,7 @@ namespace Robot
 
                 if (_mode == ModePatternB0)
                 {
+                    SetStartPhase("pattern");
                     int patternResult = -1;
                     Exception patternEx = null;
                     try
@@ -625,7 +692,7 @@ namespace Robot
                 }
                 else
                 {
-                    yield return OpenCameraAndPreview();
+                    yield return OpenCameraAndPreview(startDeadline);
                     if (_meta != null && _meta.ContainsKey("previewFailReason"))
                     {
                         failReason = _meta["previewFailReason"].ToString();
@@ -652,7 +719,7 @@ namespace Robot
 
                 _phase = RecordingSessionPhase.Recording;
                 _meta["status"] = "recording";
-                WriteMeta();
+                SetStartPhase("recording");
                 SetVisual("recording");
                 SetStatus(_mode == ModePatternB0 ? "B0 recording" : "Recording");
                 LogWindow.Info("[SurfaceEncodeProbe] recording " +
@@ -688,9 +755,10 @@ namespace Robot
             }
         }
 
-        private IEnumerator OpenCameraAndPreview()
+        private IEnumerator OpenCameraAndPreview(float startDeadline)
         {
             // Note: iterators cannot yield inside try/catch. Keep yields outside catch blocks.
+            SetStartPhase("configure_open");
             Exception configEx = null;
             try
             {
@@ -754,7 +822,8 @@ namespace Robot
             }
 
             float waited = 0f;
-            while (!openDone && waited < 12f && !_stopRequested)
+            while (!openDone && !_stopRequested && !_finalized
+                   && Time.realtimeSinceStartup < startDeadline)
             {
                 waited += Time.unscaledDeltaTime;
                 yield return null;
@@ -762,9 +831,11 @@ namespace Robot
 
             _meta["openCameraOk"] = openOk;
             _meta["openCameraWaitSec"] = waited.ToString("R", CultureInfo.InvariantCulture);
-            if (!openOk)
+            if (!openDone || !openOk)
             {
-                _meta["previewFailReason"] = "OpenCameraAsyncfor4U failed or timed out";
+                _meta["previewFailReason"] = openDone
+                    ? "OpenCameraAsyncfor4U returned false"
+                    : "OpenCameraAsyncfor4U timed out";
                 yield break;
             }
 
@@ -774,6 +845,7 @@ namespace Robot
             int previewH = _useEyeCrop ? _previewHeight : _height;
             if (_useEyeCrop)
             {
+                SetStartPhase("camera_surface");
                 int cropCreate = -99;
                 Exception cropCreateEx = null;
                 try
@@ -798,6 +870,56 @@ namespace Robot
                     yield break;
                 }
 
+                int surfacePoll = 1;
+                string surfacePollError = null;
+                while (!_finalized && !_stopRequested && Time.realtimeSinceStartup < startDeadline
+                       && surfacePollError == null)
+                {
+                    Exception pollEx = null;
+                    try
+                    {
+                        surfacePoll = _encoder.Call<int>("pollCameraSurface");
+                    }
+                    catch (Exception exception)
+                    {
+                        pollEx = exception;
+                    }
+
+                    if (pollEx != null)
+                    {
+                        surfacePollError = pollEx.Message;
+                        break;
+                    }
+
+                    if (surfacePoll == 1)
+                    {
+                        yield return null;
+                        continue;
+                    }
+
+                    break;
+                }
+
+                if (surfacePollError != null)
+                {
+                    _meta["previewFailReason"] = "pollCameraSurface: " + surfacePollError;
+                    yield break;
+                }
+
+                _meta["pollCameraSurfaceResult"] = surfacePoll;
+                if (surfacePoll == 1)
+                {
+                    _meta["previewFailReason"] = "createCameraSurface poll timeout";
+                    yield break;
+                }
+
+                if (surfacePoll != 0)
+                {
+                    _meta["previewFailReason"] = "createCameraSurface poll returned " + surfacePoll;
+                    yield break;
+                }
+
+                SetStartPhase("eye_crop");
                 int cropStart = -99;
                 Exception cropStartEx = null;
                 try
@@ -901,11 +1023,13 @@ namespace Robot
                 yield break;
             }
 
+            SetStartPhase("start_preview");
             bool previewOk = false;
             Exception previewEx = null;
             PXRCaptureRenderMode renderMode = ParseRenderMode(_eyeMode);
             try
             {
+                // Keep StartPreviewfor4U on Unity main thread (PICO API affinity).
                 previewOk = PXR_Enterprise.StartPreviewfor4U(surfacePtr, renderMode, previewW, previewH);
             }
             catch (Exception exception)
@@ -922,10 +1046,13 @@ namespace Robot
             _meta["startPreviewfor4U"] = previewOk;
             _meta["frameCallbackExpected"] =
                 "StartPreviewfor4U Surface path has no Frame.timestamp; use video_pts_us * 1000.";
-            WriteMeta();
             if (!previewOk)
             {
                 _meta["previewFailReason"] = "StartPreviewfor4U returned false";
+            }
+            else
+            {
+                SetStartPhase("preview_ok");
             }
         }
 #else

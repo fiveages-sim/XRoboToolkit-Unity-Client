@@ -8,6 +8,9 @@ import com.pxr.capturelib.PXRCameraCallBack;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Registers the capture callback before openCameraAsync.
@@ -117,5 +120,82 @@ public final class CaptureOpener {
             Log.e(TAG, "markUseStateIdle failed", error);
             return false;
         }
+    }
+
+    /** 0=idle, 1=pending, 2=done. */
+    private static final AtomicInteger finalizePoll = new AtomicInteger(0);
+    private static volatile int finalizeStopResult = -1;
+    private static volatile int finalizeCloseResult = -1;
+    private static volatile int finalizeMarkIdleOk = 0;
+    private static ExecutorService finalizeExecutor;
+
+    /**
+     * Vision stop (non-blocking for Unity): kick StopPreview+CloseCamera on a worker thread.
+     * Poll with {@link #pollFinalizeCapture()} then {@link #takeFinalizeCaptureResults()}.
+     *
+     * @return 0 accepted, -1 already running, -2 null handle
+     */
+    public static int beginFinalizeCaptureAsync(CameraHandle cameraHandle) {
+        if (cameraHandle == null) {
+            return -2;
+        }
+        if (finalizePoll.get() == 1) {
+            return -1;
+        }
+        finalizePoll.set(1);
+        finalizeStopResult = -1;
+        finalizeCloseResult = -1;
+        boolean idleOk = markUseStateIdle(cameraHandle);
+        finalizeMarkIdleOk = idleOk ? 1 : 0;
+        if (finalizeExecutor == null) {
+            finalizeExecutor = Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "VisionCaptureFinalize");
+                t.setDaemon(true);
+                return t;
+            });
+        }
+        final CameraHandle handle = cameraHandle;
+        finalizeExecutor.execute(() -> {
+            int stopResult = -1;
+            int closeResult = -1;
+            try {
+                stopResult = handle.StopPreview();
+                Log.i(TAG, "async finalize StopPreview result=" + stopResult);
+            } catch (Throwable error) {
+                Log.e(TAG, "async finalize StopPreview failed", error);
+                stopResult = -3;
+            }
+            try {
+                closeResult = handle.CloseCamera();
+                Log.i(TAG, "async finalize CloseCamera result=" + closeResult);
+            } catch (Throwable error) {
+                Log.e(TAG, "async finalize CloseCamera failed", error);
+                closeResult = -3;
+            }
+            finalizeStopResult = stopResult;
+            finalizeCloseResult = closeResult;
+            finalizePoll.set(2);
+        });
+        return 0;
+    }
+
+    /** @return 1 pending, 2 done, 0 idle */
+    public static int pollFinalizeCapture() {
+        return finalizePoll.get();
+    }
+
+    /**
+     * @return int[3]: stopPreviewResult, closeCameraResult, markIdleOk(0/1).
+     * Resets poll to idle.
+     */
+    public static int[] takeFinalizeCaptureResults() {
+        int[] out = new int[]{finalizeStopResult, finalizeCloseResult, finalizeMarkIdleOk};
+        finalizePoll.set(0);
+        return out;
+    }
+
+    /** Force-clear a stuck async finalize so a later session can stop again. */
+    public static void resetFinalizeCapture() {
+        finalizePoll.set(0);
     }
 }

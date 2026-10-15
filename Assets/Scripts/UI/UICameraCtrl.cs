@@ -425,7 +425,7 @@ public partial class UICameraCtrl : MonoBehaviour
         bool expOutputRaw = false, bool expEnableEis = false, bool expEnableMctf = false,
         bool expEnableMfnr = true, string eyeMode = "LEFT", int targetFps = 30,
         int bufferWidth = 2048, int bufferHeight = 1536,
-        int previewWidth = 4096, int previewHeight = 1536)
+        int previewWidth = 2048, int previewHeight = 1536)
     {
         // Optional B0 pattern probe only. B1/production Surface is exp_Image=1.
         int probeMode = Robot.SurfaceEncodeProbe.ResolveMode();
@@ -517,6 +517,11 @@ public partial class UICameraCtrl : MonoBehaviour
         if (_session.IsActive)
         {
             _session.RequestStop("user");
+            if (_session.NeedsForceStop())
+            {
+                _session.ForceReset("user_stop");
+            }
+
             return;
         }
 

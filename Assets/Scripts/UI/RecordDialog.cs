@@ -129,16 +129,31 @@ public class RecordDialog : MonoBehaviour
         }
     }
 
-    /// <summary>StartPreview canvas W (always SBS 4096 for for4U Surface).</summary>
+    /// <summary>
+    /// StartPreview canvas W: mono matches encode (2048); 3D is SBS (4096).
+    /// Mono no longer uses 4096+half-crop (that under-cropped vs 3D left eye).
+    /// </summary>
     public int ExpPreviewWidth
     {
-        get { return SbsWidth; }
+        get
+        {
+            int w;
+            int h;
+            ResolvePreviewSize(ExpEyeMode, out w, out h);
+            return w;
+        }
     }
 
     /// <summary>StartPreview canvas H (always 1536).</summary>
     public int ExpPreviewHeight
     {
-        get { return EyeHeight; }
+        get
+        {
+            int w;
+            int h;
+            ResolvePreviewSize(ExpEyeMode, out w, out h);
+            return h;
+        }
     }
 
     /// <summary>LEFT/RIGHT → 2048×1536; 3D → 4096×1536.</summary>
@@ -153,6 +168,12 @@ public class RecordDialog : MonoBehaviour
         {
             width = EyeWidth;
         }
+    }
+
+    /// <summary>Preview size equals encode size for all eyes (direct Surface path).</summary>
+    public static void ResolvePreviewSize(string eyeMode, out int width, out int height)
+    {
+        ResolveEncodeSize(eyeMode, out width, out height);
     }
 
     private void Start()
