@@ -35,6 +35,10 @@ namespace Robot
         private static object _sendObject = new object();
         private readonly ConcurrentQueue<NetPacket> _receivePackages = new ConcurrentQueue<NetPacket>();
         private static readonly ConcurrentQueue<SendData> _sendDatas = new ConcurrentQueue<SendData>();
+        // Soft cap: refuse enqueue when disconnected backlog would otherwise grow forever
+        // (ExtDev SendCustomData keeps firing while socket is null).
+        private const int MaxOutboundQueueDepth = 64;
+        private static volatile int s_outboundAccepting;
 
         private Socket _socket;
         private int _connectionGeneration;
@@ -66,11 +70,13 @@ namespace Robot
         /// caps first; Head packet rate is never reduced here.
         /// </summary>
         [SerializeField] private bool autoThrottleEnabled = true;
-        [SerializeField] private float bandwidthBudgetKiBps = 1200f;
-        [SerializeField] private float bandwidthRecoverMarginKiBps = 250f;
+        // LAN default: Head@400 + Hand@~300 ≈ 1.8–2.1MB/s. Raise for wired/good Wi‑Fi;
+        // lower (e.g. 1200) on weak links. Changeable in Inspector or SetBandwidthBudgetKiBps.
+        [SerializeField] private float bandwidthBudgetKiBps = 2000f;
+        [SerializeField] private float bandwidthRecoverMarginKiBps = 400f;
         // Start at panel-class rate; auto-throttle steps down under bandwidth pressure.
         [SerializeField] private int auxThrottleMaxHz = 400;
-        [SerializeField] private int auxThrottleMinHz = 15;
+        [SerializeField] private int auxThrottleMinHz = 30;
         [SerializeField] private int auxThrottleStepHz = 25;
         private Thread _sendThread;
         private Thread _trackingThread;
@@ -106,6 +112,16 @@ namespace Robot
         private long _trackingBytesSentInWindow = 0;
         private string _lastTrackingSendMode = "idle";
         private string _lastDirectTrackingGateStatus;
+        private bool _lastGateReady;
+        private bool _lastGateSend;
+        private bool _lastGateDirectEnabled;
+        private int _lastGateSource = int.MinValue;
+        private bool _lastGateHead;
+        private bool _lastGateController;
+        private bool _lastGateHand;
+        private int _lastGateTrackingType = int.MinValue;
+        private SocketState _lastGateState = (SocketState)(-1);
+        private bool _lastGateConnectInited;
         private long _lastEnterpriseControllerPayloadLogTicks;
 
         // Direct tracking instrumentation counters (reset each reporting window)
@@ -114,6 +130,18 @@ namespace Robot
         private long _directNewSampleCount;
         private long _directEnqueueCount;
         private long _lastDirectStatsLogTicks;
+        private int _throttleOverBudgetStreak;
+
+        private const string PrefsBandwidthBudgetKiBps = "TcpBandwidthBudgetKiBps";
+        // Send-thread mirrors of Inspector fields (ApplyTrackingSendPolicy publishes them).
+        private static float s_bandwidthBudgetKiBps = 2000f;
+        private static float s_bandwidthRecoverMarginKiBps = 400f;
+        private static int s_auxThrottleMaxHz = 400;
+        private static int s_auxThrottleMinHz = 30;
+        private static int s_auxThrottleStepHz = 25;
+        private static int s_throttleOverBudgetWindows = 1;
+        // Consecutive 1s over-budget windows before stepping auxHz down (was 3 ≈ 3s lag).
+        [SerializeField] private int throttleOverBudgetWindows = 1;
 
         private void Awake()
         {
@@ -121,7 +149,16 @@ namespace Robot
             _sendThread = new Thread(OnSendThread);
             _trackingThread = new Thread(OnTrackingThread);
             _trackingRateStopwatch.Start();
+            if (PlayerPrefs.HasKey(PrefsBandwidthBudgetKiBps))
+            {
+                bandwidthBudgetKiBps = PlayerPrefs.GetFloat(
+                    PrefsBandwidthBudgetKiBps, bandwidthBudgetKiBps);
+            }
+
             ApplyTrackingSendPolicy();
+            Debug.Log($"{Tag}bandwidth budget effective={SharedBandwidthBudgetKiBps:F0} KiB/s " +
+                      $"(serialized={bandwidthBudgetKiBps:F0}, prefs=" +
+                      $"{(PlayerPrefs.HasKey(PrefsBandwidthBudgetKiBps) ? PlayerPrefs.GetFloat(PrefsBandwidthBudgetKiBps).ToString("F0") : "none")})");
         }
 
         private void OnValidate()
@@ -135,8 +172,19 @@ namespace Robot
             Volatile.Write(ref s_autoThrottleEnabled, autoThrottleEnabled ? 1 : 0);
             int maxHz = Mathf.Clamp(auxThrottleMaxHz, 1, 1000);
             int minHz = Mathf.Clamp(auxThrottleMinHz, 1, maxHz);
+            int step = Mathf.Max(1, auxThrottleStepHz);
             auxThrottleMaxHz = maxHz;
             auxThrottleMinHz = minHz;
+            auxThrottleStepHz = step;
+            bandwidthBudgetKiBps = Mathf.Max(100f, bandwidthBudgetKiBps);
+            bandwidthRecoverMarginKiBps = Mathf.Max(0f, bandwidthRecoverMarginKiBps);
+            throttleOverBudgetWindows = Mathf.Max(1, throttleOverBudgetWindows);
+            Volatile.Write(ref s_auxThrottleMaxHz, maxHz);
+            Volatile.Write(ref s_auxThrottleMinHz, minHz);
+            Volatile.Write(ref s_auxThrottleStepHz, step);
+            Volatile.Write(ref s_bandwidthBudgetKiBps, bandwidthBudgetKiBps);
+            Volatile.Write(ref s_bandwidthRecoverMarginKiBps, bandwidthRecoverMarginKiBps);
+            Volatile.Write(ref s_throttleOverBudgetWindows, throttleOverBudgetWindows);
             int cur = Volatile.Read(ref s_auxThrottleHz);
             // Clamp into range; prefer max when unset/stale so Hand can track panel until budget bites.
             if (cur < minHz || cur > maxHz || cur == 0)
@@ -164,6 +212,45 @@ namespace Robot
         {
             get { return Math.Max(1, Volatile.Read(ref s_auxThrottleHz)); }
         }
+
+        public static float SharedBandwidthBudgetKiBps
+        {
+            get { return Volatile.Read(ref s_bandwidthBudgetKiBps); }
+        }
+
+        /// <summary>
+        /// Runtime budget tweak (KiB/s). Persists via PlayerPrefs so APK rebuilds / scene
+        /// serialized defaults cannot silently override a device-side choice.
+        /// </summary>
+        public void SetBandwidthBudgetKiBps(float kibPerSecond)
+        {
+            bandwidthBudgetKiBps = Mathf.Max(100f, kibPerSecond);
+            PlayerPrefs.SetFloat(PrefsBandwidthBudgetKiBps, bandwidthBudgetKiBps);
+            PlayerPrefs.Save();
+            ApplyTrackingSendPolicy();
+            Debug.Log($"{Tag}bandwidth budget set to {SharedBandwidthBudgetKiBps:F0} KiB/s (persisted)");
+        }
+
+        /// <summary>
+        /// Static entry for UI / tools when they hold no TcpHandler reference.
+        /// </summary>
+        public static void SetSharedBandwidthBudgetKiBps(float kibPerSecond)
+        {
+            TcpHandler handler = FindObjectOfType<TcpHandler>();
+            if (handler != null)
+            {
+                handler.SetBandwidthBudgetKiBps(kibPerSecond);
+                return;
+            }
+
+            float budget = Mathf.Max(100f, kibPerSecond);
+            PlayerPrefs.SetFloat(PrefsBandwidthBudgetKiBps, budget);
+            PlayerPrefs.Save();
+            Volatile.Write(ref s_bandwidthBudgetKiBps, budget);
+            Debug.Log($"{Tag}bandwidth budget set to {budget:F0} KiB/s (no instance; prefs+static)");
+        }
+
+        public float BandwidthBudgetKiBps => SharedBandwidthBudgetKiBps;
 
         public SocketState State
         {
@@ -288,6 +375,7 @@ namespace Robot
                         _reconnectEnable = true;
                         _state = SocketState.WORKING;
                         _connectInited = false;
+                        Volatile.Write(ref s_outboundAccepting, 1);
                     }
                     else if (IsCurrentAttemptLocked(attempt))
                     {
@@ -478,14 +566,44 @@ namespace Robot
 
         public static void Send(byte cmd, string msg)
         {
-            _sendDatas.Enqueue(new SendData(cmd, Encoding.UTF8.GetBytes(msg)));
-            s_sendSignal.Set();
+            TryEnqueueOutbound(new SendData(cmd, Encoding.UTF8.GetBytes(msg)));
         }
 
         public static void SendCustomData(byte[] msg)
         {
-            _sendDatas.Enqueue(new SendData(NetCMD.PACKET_CMD_CUSTOM_TO_PC, msg));
+            TryEnqueueOutbound(new SendData(NetCMD.PACKET_CMD_CUSTOM_TO_PC, msg));
+        }
+
+        private static bool TryEnqueueOutbound(SendData sendData)
+        {
+            if (Volatile.Read(ref s_outboundAccepting) == 0)
+            {
+                return false;
+            }
+
+            if (_sendDatas.Count >= MaxOutboundQueueDepth)
+            {
+                return false;
+            }
+
+            _sendDatas.Enqueue(sendData);
             s_sendSignal.Set();
+            return true;
+        }
+
+        private void DrainOutboundQueue()
+        {
+            while (_sendDatas.TryDequeue(out SendData sendData))
+            {
+                if (sendData.IsDirectTracking &&
+                    Interlocked.Decrement(ref _pendingDirectTrackingPackets) < 0)
+                {
+                    Interlocked.Exchange(ref _pendingDirectTrackingPackets, 0);
+                }
+            }
+
+            Interlocked.Exchange(ref _pendingDirectTrackingPackets, 0);
+            NotifyTrackingSampleAvailable();
         }
 
         private void Update()
@@ -641,22 +759,48 @@ namespace Robot
 
         private void OnTrackingThread()
         {
+#if UNITY_ANDROID && !UNITY_EDITOR
+            // Required before Utils.GetElapsedRealtimeNs() JNI CallStatic on this thread.
+            AndroidJNI.AttachCurrentThread();
+#endif
             while (_state != SocketState.DESTROY)
             {
+                try
+                {
+                    OnTrackingThreadOnce();
+                }
+                catch (Exception e)
+                {
+                    // Without this, any ToJson/NRE/FormatException kills the loop forever:
+                    // no crash UI, just silent "no Tracking packets".
+                    Debug.LogError(Tag + "OnTrackingThread: " + e);
+                    LogWindow.Error($"TCP tracking thread error: {e.Message}");
+                    WaitForTrackingSample(trackingThreadIdleSleepMs);
+                }
+            }
+#if UNITY_ANDROID && !UNITY_EDITOR
+            AndroidJNI.DetachCurrentThread();
+#endif
+        }
+
+        private void OnTrackingThreadOnce()
+        {
                 if (!IsEnterpriseDirectTrackingReady())
                 {
                     LogEnterpriseDirectTrackingGateIfChanged();
                     ResetDirectTrackingCache();
                     WaitForTrackingSample(trackingThreadIdleSleepMs);
-                    continue;
+                    return;
                 }
 
-                // Backpressure: do not build another direct packet. Wait for send to drain
-                // (NotifyTrackingSampleAvailable after pending--), not Sleep-and-miss the beat.
+                // Backpressure: do not build another direct packet. Wait on
+                // s_trackingSampleSignal — woken by (1) OnSendThread after pending-- on a
+                // direct packet (NotifyTrackingSampleAvailable), and/or (2) new sample
+                // Publish from Enterprise/Aux. Do not Sleep-and-miss the beat.
                 if (_pendingDirectTrackingPackets >= 2)
                 {
                     WaitForTrackingSample(trackingThreadQueueBackpressureSleepMs);
-                    continue;
+                    return;
                 }
 
                 Interlocked.Increment(ref _directLoopCount);
@@ -665,6 +809,7 @@ namespace Robot
                 // JsonData objects until we know that at least one source has advanced.
                 string headPose = null;
                 int headStatus = 0;
+                long headPoseTimeStampNs = 0;
                 EnterpriseCollectionRecorder.EnterpriseControllerTcpPose leftController =
                     default(EnterpriseCollectionRecorder.EnterpriseControllerTcpPose);
                 EnterpriseCollectionRecorder.EnterpriseControllerTcpPose rightController =
@@ -689,7 +834,8 @@ namespace Robot
                     if (!EnterpriseCollectionRecorder.TryGetLatestEnterpriseHeadForTcp(
                             out headPose,
                             out headStatus,
-                            out headSampleSeq))
+                            out headSampleSeq,
+                            out headPoseTimeStampNs))
                     {
                         // Head requested but not ready yet: do not block Hand/Tracker-only sends.
                         if (!TrackingData.ControllerOn &&
@@ -697,7 +843,7 @@ namespace Robot
                             TrackingData.TrackingTypeValue <= TrackingData.TrackingType.None)
                         {
                             WaitForTrackingSample(trackingThreadWaitForHeadSleepMs);
-                            continue;
+                            return;
                         }
                     }
                     else
@@ -744,7 +890,7 @@ namespace Robot
                 {
                     Interlocked.Increment(ref _directStaleReadCount);
                     WaitForTrackingSample(trackingThreadSampleWaitTimeoutMs);
-                    continue;
+                    return;
                 }
 
                 Interlocked.Increment(ref _directNewSampleCount);
@@ -752,7 +898,7 @@ namespace Robot
                 if (!SendTrackingData)
                 {
                     WaitForTrackingSample(trackingThreadIdleSleepMs);
-                    continue;
+                    return;
                 }
 
                 // A packet already carries the latest sample of every enabled source, so
@@ -790,12 +936,11 @@ namespace Robot
                 {
                     // Non-primary source advanced only: wait for primary (usually Head) event.
                     WaitForTrackingSample(trackingThreadSampleWaitTimeoutMs);
-                    continue;
+                    return;
                 }
 
                 bool omitUnchanged = OmitUnchangedSourcesEnabled;
-                // Include source if official bundle, or B0 and seq advanced. Always emit
-                // timeStampNs so fa-py frame gate advances even when only Head changed.
+                // Include source if official bundle, or B0 and seq advanced.
                 bool includeHead = TrackingData.HeadOn && !string.IsNullOrEmpty(headPose) &&
                                    (!omitUnchanged || headNew);
                 bool includeController = TrackingData.ControllerOn &&
@@ -817,8 +962,11 @@ namespace Robot
                 if (includeHead)
                 {
                     AppendJsonField(valueBuilder, ref hasField, "Head");
+                    // tsNs = sensor poseTimeStampNs (BOOTTIME); additive / ignore-unknown OK.
                     valueBuilder.Append("{\"pose\":\"").Append(headPose)
-                        .Append("\",\"status\":").Append(headStatus).Append('}');
+                        .Append("\",\"status\":").Append(headStatus)
+                        .Append(",\"tsNs\":").Append(headPoseTimeStampNs)
+                        .Append('}');
                 }
 
                 if (includeController)
@@ -858,21 +1006,35 @@ namespace Robot
                     valueBuilder.Append(motionJson);
                 }
 
+                // Keep legacy wall-ish timeStampNs (ms*1e6) so fa-py latency / frame-gate
+                // stays compatible. unixNs is additive high-res wall clock (ignore-unknown OK).
+                // Per-source BOOTTIME lives under Head.tsNs / Controller.timeStampNs.
                 AppendJsonField(valueBuilder, ref hasField, "timeStampNs");
                 valueBuilder.Append(Utils.GetCurrentTimestamp());
+                AppendJsonField(valueBuilder, ref hasField, "unixNs");
+                valueBuilder.Append(Utils.GetUnixTimeNs());
                 AppendJsonField(valueBuilder, ref hasField, "appState");
                 valueBuilder.Append(_cachedAppFocus ? "{\"focus\":true}" : "{\"focus\":false}");
                 AppendJsonField(valueBuilder, ref hasField, "Input");
                 valueBuilder.Append(_cachedActiveInputDevice);
                 valueBuilder.Append('}');
 
-                _sendDatas.Enqueue(new SendData(
-                    NetCMD.PACKET_CCMD_TO_CONTROLLER_FUNCTION,
-                    Encoding.UTF8.GetBytes(BuildTrackingFunctionPacket(valueBuilder)),
-                    true));
-                s_sendSignal.Set();
-                Interlocked.Increment(ref _directEnqueueCount);
                 Interlocked.Increment(ref _pendingDirectTrackingPackets);
+                if (!TryEnqueueOutbound(new SendData(
+                        NetCMD.PACKET_CCMD_TO_CONTROLLER_FUNCTION,
+                        Encoding.UTF8.GetBytes(BuildTrackingFunctionPacket(valueBuilder)),
+                        true)))
+                {
+                    if (Interlocked.Decrement(ref _pendingDirectTrackingPackets) < 0)
+                    {
+                        Interlocked.Exchange(ref _pendingDirectTrackingPackets, 0);
+                    }
+
+                    WaitForTrackingSample(trackingThreadQueueBackpressureSleepMs);
+                    return;
+                }
+
+                Interlocked.Increment(ref _directEnqueueCount);
                 // B0: only advance last-sent seq for sources actually carried; skipped
                 // sources stay "new" for a later packet (or until throttle allows).
                 if (!omitUnchanged || includeHead)
@@ -901,7 +1063,6 @@ namespace Robot
                 }
 
                 LogDirectTrackingStatsIfNeeded(headSampleSeq, controllerSampleSeq);
-            }
         }
 
         private bool ShouldSendEnterpriseTrackingDirectly()
@@ -956,7 +1117,16 @@ namespace Robot
                         packet.Append("\\t");
                         break;
                     default:
-                        packet.Append(c);
+                        if (c < ' ')
+                        {
+                            packet.Append("\\u");
+                            packet.Append(((int)c).ToString("x4"));
+                        }
+                        else
+                        {
+                            packet.Append(c);
+                        }
+
                         break;
                 }
             }
@@ -1113,17 +1283,48 @@ namespace Robot
 
         private void LogEnterpriseDirectTrackingGateIfChanged()
         {
-            string status = $"ready={IsEnterpriseDirectTrackingReady()} send={SendTrackingData} " +
-                            $"directEnabled={EnterpriseDirectTrackingEnabled} " +
-                            $"source={TrackingDataSourceCtrl.CurrentSource} " +
-                            $"head={TrackingData.HeadOn} controller={TrackingData.ControllerOn} " +
-                            $"hand={TrackingData.HandTrackingOn} trackingType={TrackingData.TrackingTypeValue} " +
-                            $"state={_state} connectInited={_connectInited}";
-            if (status == _lastDirectTrackingGateStatus)
+            // Compare scalars first — do not allocate / ToString enums at 400Hz when unchanged.
+            bool ready = IsEnterpriseDirectTrackingReady();
+            bool send = SendTrackingData;
+            bool directEnabled = EnterpriseDirectTrackingEnabled;
+            int source = (int)TrackingDataSourceCtrl.CurrentSource;
+            bool head = TrackingData.HeadOn;
+            bool controller = TrackingData.ControllerOn;
+            bool hand = TrackingData.HandTrackingOn;
+            int trackingType = (int)TrackingData.TrackingTypeValue;
+            SocketState state = _state;
+            bool connectInited = _connectInited;
+            if (ready == _lastGateReady &&
+                send == _lastGateSend &&
+                directEnabled == _lastGateDirectEnabled &&
+                source == _lastGateSource &&
+                head == _lastGateHead &&
+                controller == _lastGateController &&
+                hand == _lastGateHand &&
+                trackingType == _lastGateTrackingType &&
+                state == _lastGateState &&
+                connectInited == _lastGateConnectInited)
             {
                 return;
             }
 
+            _lastGateReady = ready;
+            _lastGateSend = send;
+            _lastGateDirectEnabled = directEnabled;
+            _lastGateSource = source;
+            _lastGateHead = head;
+            _lastGateController = controller;
+            _lastGateHand = hand;
+            _lastGateTrackingType = trackingType;
+            _lastGateState = state;
+            _lastGateConnectInited = connectInited;
+
+            string status =
+                $"ready={ready} send={send} directEnabled={directEnabled} " +
+                $"source={TrackingDataSourceCtrl.CurrentSource} " +
+                $"head={head} controller={controller} hand={hand} " +
+                $"trackingType={TrackingData.TrackingTypeValue} state={state} " +
+                $"connectInited={connectInited}";
             _lastDirectTrackingGateStatus = status;
             string message = $"TCP enterprise direct gate changed: {status}";
             LogWindow.Info(message);
@@ -1170,7 +1371,7 @@ namespace Robot
             string rateMessage =
                 $"TCP tracking send rate: {sendHz:F1}Hz {kibPerSecond:F1}KiB/s mode={_lastTrackingSendMode} " +
                 $"pending={_pendingDirectTrackingPackets} omitUnchanged={OmitUnchangedSourcesEnabled} " +
-                $"auxThrottleHz={SharedAuxThrottleHz}";
+                $"auxThrottleHz={SharedAuxThrottleHz} budget={SharedBandwidthBudgetKiBps:F0}";
             if (outputTrackingRateToLogWindow)
             {
                 LogWindow.Info(rateMessage);
@@ -1188,21 +1389,35 @@ namespace Robot
                 return;
             }
 
-            int maxHz = Mathf.Clamp(auxThrottleMaxHz, 1, 1000);
-            int minHz = Mathf.Clamp(auxThrottleMinHz, 1, maxHz);
-            int step = Mathf.Max(1, auxThrottleStepHz);
+            int maxHz = Mathf.Clamp(Volatile.Read(ref s_auxThrottleMaxHz), 1, 1000);
+            int minHz = Mathf.Clamp(Volatile.Read(ref s_auxThrottleMinHz), 1, maxHz);
+            int step = Mathf.Max(1, Volatile.Read(ref s_auxThrottleStepHz));
+            float budget = Volatile.Read(ref s_bandwidthBudgetKiBps);
+            float recoverMargin = Volatile.Read(ref s_bandwidthRecoverMarginKiBps);
+            int overWindows = Mathf.Max(1, Volatile.Read(ref s_throttleOverBudgetWindows));
             int cur = Volatile.Read(ref s_auxThrottleHz);
             cur = Mathf.Clamp(cur, minHz, maxHz);
 
-            bool overBudget = kibPerSecond > bandwidthBudgetKiBps || pending >= 2;
-            bool underBudget = kibPerSecond < (bandwidthBudgetKiBps - Mathf.Max(0f, bandwidthRecoverMarginKiBps)) &&
-                               pending <= 0;
+            // Bandwidth-only step-down (pending>=2 alone used to false-trigger). Default
+            // overWindows=1 → react on the next 1s rate window, not after ~3s of bleeding.
+            bool bandwidthOver = kibPerSecond > budget;
+            bool bandwidthUnder = kibPerSecond < (budget - Mathf.Max(0f, recoverMargin));
+            if (bandwidthOver)
+            {
+                _throttleOverBudgetStreak++;
+            }
+            else
+            {
+                _throttleOverBudgetStreak = 0;
+            }
+
             int next = cur;
-            if (overBudget && cur > minHz)
+            if (_throttleOverBudgetStreak >= overWindows && cur > minHz)
             {
                 next = Math.Max(minHz, cur - step);
+                _throttleOverBudgetStreak = 0;
             }
-            else if (underBudget && cur < maxHz)
+            else if (bandwidthUnder && pending <= 1 && cur < maxHz)
             {
                 next = Math.Min(maxHz, cur + step);
             }
@@ -1211,7 +1426,7 @@ namespace Robot
             {
                 Volatile.Write(ref s_auxThrottleHz, next);
                 Debug.Log($"{Tag}auto-throttle auxHz {cur} -> {next} " +
-                          $"(kib/s={kibPerSecond:F1} budget={bandwidthBudgetKiBps:F0} pending={pending})");
+                          $"(kib/s={kibPerSecond:F1} budget={budget:F0} pending={pending})");
             }
         }
 
@@ -1284,6 +1499,12 @@ namespace Robot
 
                 if (socket == null)
                 {
+                    // Do not leave ExtDev/custom packets queued across a disconnect gap.
+                    if (Volatile.Read(ref s_outboundAccepting) == 0)
+                    {
+                        DrainOutboundQueue();
+                    }
+
                     Thread.Sleep(100);
                     continue;
                 }
@@ -1433,14 +1654,14 @@ namespace Robot
                 _connectionGeneration++;
                 _state = SocketState.CLOSE;
                 _connectInited = false;
+                Volatile.Write(ref s_outboundAccepting, 0);
                 socket = _socket;
                 _socket = null;
             }
 
             ResetDirectTrackingCache();
             EnterpriseAuxTrackingSampler.ClearCaches();
-            Interlocked.Exchange(ref _pendingDirectTrackingPackets, 0);
-            NotifyTrackingSampleAvailable();
+            DrainOutboundQueue();
             DisposeSocket(socket);
         }
 
@@ -1457,6 +1678,7 @@ namespace Robot
                 _connectionGeneration++;
                 _state = SocketState.CLOSE;
                 _connectInited = false;
+                Volatile.Write(ref s_outboundAccepting, 0);
                 socket = _socket;
                 _socket = null;
             }
@@ -1466,8 +1688,7 @@ namespace Robot
             ClearReceiveQueue();
             ResetDirectTrackingCache();
             EnterpriseAuxTrackingSampler.ClearCaches();
-            Interlocked.Exchange(ref _pendingDirectTrackingPackets, 0);
-            NotifyTrackingSampleAvailable();
+            DrainOutboundQueue();
             DisposeSocket(socket);
         }
 

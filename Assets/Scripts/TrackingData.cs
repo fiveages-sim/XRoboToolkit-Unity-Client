@@ -167,36 +167,119 @@ namespace Robot
             return _handData;
         }
 
+        public enum HandSampleResult
+        {
+            Failed = 0,
+            Unchanged = 1,
+            Changed = 2
+        }
+
         /// <summary>
         /// Samples Hand for the aux sidechannel. False when neither hand updated this call.
         /// </summary>
         public bool TryBuildHandJson(out JsonData handJson)
         {
+            return TrySampleHand(0, buildJsonEvenIfUnchanged: true, out handJson, out _) !=
+                   HandSampleResult.Failed;
+        }
+
+        /// <summary>
+        /// Fingerprint raw joint floats before ToString/ToJson. Unchanged skips ~5KB alloc.
+        /// </summary>
+        public HandSampleResult TrySampleHand(
+            ulong previousFingerprint,
+            bool buildJsonEvenIfUnchanged,
+            out JsonData handJson,
+            out ulong fingerprint)
+        {
             handJson = null;
-            bool any = false;
+            fingerprint = 0;
+            bool leftOk = false;
+            bool rightOk = false;
+            ulong fp = 14695981039346656037UL; // FNV offset basis
             HandJointLocations leftHand = new HandJointLocations();
             if (PXR_HandTracking.GetJointLocations(HandType.HandLeft, ref leftHand))
             {
-                GetHandTrackingData(leftHand, ref _leftHandData);
-                _handData["leftHand"] = _leftHandData;
-                any = true;
+                fp = MixHandFingerprint(fp, leftHand);
+                leftOk = true;
             }
 
             HandJointLocations rightHand = new HandJointLocations();
             if (PXR_HandTracking.GetJointLocations(HandType.HandRight, ref rightHand))
             {
-                GetHandTrackingData(rightHand, ref _rightHandData);
-                _handData["rightHand"] = _rightHandData;
-                any = true;
+                fp = MixHandFingerprint(fp, rightHand);
+                rightOk = true;
             }
 
-            if (!any)
+            if (!leftOk && !rightOk)
             {
-                return false;
+                return HandSampleResult.Failed;
+            }
+
+            fingerprint = fp;
+            bool unchanged = previousFingerprint != 0 && fp == previousFingerprint;
+            if (unchanged && !buildJsonEvenIfUnchanged)
+            {
+                return HandSampleResult.Unchanged;
+            }
+
+            if (leftOk)
+            {
+                GetHandTrackingData(leftHand, ref _leftHandData);
+                _handData["leftHand"] = _leftHandData;
+            }
+
+            if (rightOk)
+            {
+                GetHandTrackingData(rightHand, ref _rightHandData);
+                _handData["rightHand"] = _rightHandData;
             }
 
             handJson = _handData;
-            return true;
+            return unchanged ? HandSampleResult.Unchanged : HandSampleResult.Changed;
+        }
+
+        private static ulong MixHandFingerprint(ulong hash, HandJointLocations hand)
+        {
+            hash = MixU64(hash, hand.isActive);
+            hash = MixU64(hash, hand.jointCount);
+            hash = MixFloat(hash, hand.handScale);
+            if (hand.jointLocations == null)
+            {
+                return hash;
+            }
+
+            int count = (int)Math.Min(hand.jointCount, (uint)hand.jointLocations.Length);
+            for (int i = 0; i < count; i++)
+            {
+                HandJointLocation joint = hand.jointLocations[i];
+                hash = MixU64(hash, (ulong)joint.locationStatus);
+                hash = MixFloat(hash, joint.radius);
+                hash = MixFloat(hash, joint.pose.Position.x);
+                hash = MixFloat(hash, joint.pose.Position.y);
+                hash = MixFloat(hash, joint.pose.Position.z);
+                hash = MixFloat(hash, joint.pose.Orientation.x);
+                hash = MixFloat(hash, joint.pose.Orientation.y);
+                hash = MixFloat(hash, joint.pose.Orientation.z);
+                hash = MixFloat(hash, joint.pose.Orientation.w);
+            }
+
+            return hash;
+        }
+
+        private static ulong MixU64(ulong hash, ulong value)
+        {
+            unchecked
+            {
+                hash ^= value;
+                hash *= 1099511628211UL; // FNV prime
+                return hash;
+            }
+        }
+
+        private static ulong MixFloat(ulong hash, float value)
+        {
+            return MixU64(hash, unchecked((uint)BitConverter.SingleToInt32Bits(value)));
         }
 
         public bool TryBuildBodyJson(out JsonData bodyJson)

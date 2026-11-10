@@ -22,6 +22,7 @@ namespace Robot
         private static bool s_hasLatestEnterpriseHead;
         private static string s_latestEnterpriseHeadPose;
         private static int s_latestEnterpriseHeadStatus;
+        private static long s_latestEnterpriseHeadPoseTimeStampNs;
         private static long s_latestEnterpriseHeadSampleSeq;
         private static readonly object s_latestEnterpriseControllerLock = new object();
         private static bool s_hasLatestEnterpriseController;
@@ -394,17 +395,42 @@ namespace Robot
 
         public static bool TryGetLatestEnterpriseHeadForTcp(out string pose, out int status)
         {
-            return TryGetLatestEnterpriseHeadForTcp(out pose, out status, out _);
+            return TryGetLatestEnterpriseHeadForTcp(out pose, out status, out _, out _);
         }
 
         public static bool TryGetLatestEnterpriseHeadForTcp(out string pose, out int status, out long sampleSeq)
+        {
+            return TryGetLatestEnterpriseHeadForTcp(out pose, out status, out sampleSeq, out _);
+        }
+
+        public static bool TryGetLatestEnterpriseHeadForTcp(
+            out string pose, out int status, out long sampleSeq, out long poseTimeStampNs)
         {
             lock (s_latestEnterpriseHeadLock)
             {
                 pose = s_latestEnterpriseHeadPose;
                 status = s_latestEnterpriseHeadStatus;
                 sampleSeq = s_latestEnterpriseHeadSampleSeq;
+                poseTimeStampNs = s_latestEnterpriseHeadPoseTimeStampNs;
                 return s_hasLatestEnterpriseHead && !string.IsNullOrEmpty(pose);
+            }
+        }
+
+        public static bool HasLatestEnterpriseHeadForTcp()
+        {
+            lock (s_latestEnterpriseHeadLock)
+            {
+                return s_hasLatestEnterpriseHead && !string.IsNullOrEmpty(s_latestEnterpriseHeadPose);
+            }
+        }
+
+        public static bool HasLatestEnterpriseControllerForTcp()
+        {
+            lock (s_latestEnterpriseControllerLock)
+            {
+                return s_hasLatestEnterpriseController &&
+                       (s_latestEnterpriseLeftController.HasPose ||
+                        s_latestEnterpriseRightController.HasPose);
             }
         }
 
@@ -770,6 +796,7 @@ namespace Robot
             {
                 s_latestEnterpriseHeadPose = pose;
                 s_latestEnterpriseHeadStatus = sensorState.status;
+                s_latestEnterpriseHeadPoseTimeStampNs = unchecked((long)sensorState.poseTimeStampNs);
                 s_latestEnterpriseHeadSampleSeq++;
                 s_hasLatestEnterpriseHead = true;
             }
@@ -784,6 +811,7 @@ namespace Robot
                 s_hasLatestEnterpriseHead = false;
                 s_latestEnterpriseHeadPose = null;
                 s_latestEnterpriseHeadStatus = 0;
+                s_latestEnterpriseHeadPoseTimeStampNs = 0;
                 s_latestEnterpriseHeadSampleSeq = 0;
             }
         }

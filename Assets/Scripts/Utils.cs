@@ -9,6 +9,12 @@ namespace Robot
 {
     public class Utils
     {
+        /// <summary>
+        /// Legacy wall-clock value used by older paths: ms since Unix epoch scaled by 1e6
+        /// (not true nanosecond resolution — duplicates under ~1kHz). Prefer
+        /// <see cref="GetElapsedRealtimeNs"/> for Tracking timeStampNs and
+        /// <see cref="GetUnixTimeNs"/> for wall clock.
+        /// </summary>
         public static long GetCurrentTimestamp()
         {
             DateTime epoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
@@ -17,15 +23,32 @@ namespace Robot
         }
 
         /// <summary>
+        /// Unix epoch wall-clock nanoseconds (DateTime ticks; typically better than ms*1e6).
+        /// May still jump with NTP; not the same family as PICO frame timestamps.
+        /// </summary>
+        public static long GetUnixTimeNs()
+        {
+            DateTime epoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+            return (DateTime.UtcNow - epoch).Ticks * 100L;
+        }
+
+        /// <summary>
         /// CLOCK_BOOTTIME nanoseconds from android.os.SystemClock.elapsedRealtimeNanos.
-        /// This is the same clock family as PICO Frame.timestamp (exposure start, ns, BOOTTIME).
-        /// It is not Unix time and it is not MediaCodec PTS.
+        /// Same clock family as PICO Frame.timestamp (exposure start, ns, BOOTTIME).
+        /// Monotonic for Tracking timeStampNs / fa-py frame gate. Not Unix time / MediaCodec PTS.
         /// </summary>
         private static AndroidJavaClass _elapsedClock;
+        // Once JNI fails, stick to Stopwatch so we do not oscillate BOOTTIME↔Stopwatch.
+        private static bool _elapsedUseStopwatchFallback;
 
         public static long GetElapsedRealtimeNs()
         {
 #if UNITY_ANDROID && !UNITY_EDITOR
+            if (_elapsedUseStopwatchFallback)
+            {
+                return GetStopwatchTimeNs();
+            }
+
             try
             {
                 if (_elapsedClock == null)
@@ -38,11 +61,22 @@ namespace Robot
             catch (Exception exception)
             {
                 Debug.LogWarning("[Utils] elapsedRealtimeNanos failed: " + exception.Message);
-                return 0;
+                // Stay in a monotonic family — never jump to Unix wall clock (fa-py deltas explode).
+                _elapsedUseStopwatchFallback = true;
+                return GetStopwatchTimeNs();
             }
 #else
-            return 0;
+            return GetStopwatchTimeNs();
 #endif
+        }
+
+        /// <summary>
+        /// Process-monotonic nanoseconds from Stopwatch (not BOOTTIME, but never jumps to Unix).
+        /// </summary>
+        public static long GetStopwatchTimeNs()
+        {
+            return (long)(System.Diagnostics.Stopwatch.GetTimestamp() *
+                          (1e9 / System.Diagnostics.Stopwatch.Frequency));
         }
 
         //Obtain the local IPv4 address
