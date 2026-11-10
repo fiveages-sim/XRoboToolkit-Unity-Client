@@ -46,24 +46,13 @@ public partial class UICameraCtrl : MonoBehaviour
     public Toggle visionToggle;
 
     private readonly Robot.VisionTrackingSession _session = new Robot.VisionTrackingSession();
-    private readonly Robot.ApiFrameSession _apiSession = new Robot.ApiFrameSession();
     private readonly Robot.SurfaceEncodeProbe _surfaceProbe = new Robot.SurfaceEncodeProbe();
-    private bool _useApiCapture;
     private bool _useSurfaceProbe;
 
     private bool _recordTrackingData
     {
-        get
-        {
-            return _useApiCapture ? _apiSession.TrackingWriteEnabled : _session.TrackingWriteEnabled;
-        }
-        set
-        {
-            if (!_useApiCapture)
-            {
-                _session.TrackingWriteEnabled = value;
-            }
-        }
+        get { return _session.TrackingWriteEnabled; }
+        set { _session.TrackingWriteEnabled = value; }
     }
 
     private void Awake()
@@ -72,6 +61,7 @@ public partial class UICameraCtrl : MonoBehaviour
         TcpHandler.ReceiveFunctionEvent += OnNetReceive;
         CameraHandle.AddStateListener(OnCameraStateChanged);
         UnityMainThreadDispatcher.Instance();
+        Robot.SurfaceEncodeProbe.ClearLegacyMarkers();
         EnsureRecordStatusText();
         SetRemoteVisionStatus("Idle");
         SetRecordStatus("Idle");
@@ -343,16 +333,11 @@ public partial class UICameraCtrl : MonoBehaviour
         {
             _surfaceProbe.RequestStop("object destroyed");
         }
-
-        if (_apiSession.IsActive)
-        {
-            _apiSession.RequestStop("object destroyed");
-        }
     }
 
     private bool AnyRecordSessionActive()
     {
-        return _session.IsActive || _apiSession.IsActive || _surfaceProbe.IsActive;
+        return _session.IsActive || _surfaceProbe.IsActive;
     }
 
     private void OnRecordBtn(bool on)
@@ -414,7 +399,6 @@ public partial class UICameraCtrl : MonoBehaviour
         {
             if (trackingToggle.isOn)
             {
-                _useApiCapture = false;
                 _session.Begin(this, 2160, 810, 30, 0, false, true);
             }
         }
@@ -427,22 +411,9 @@ public partial class UICameraCtrl : MonoBehaviour
         int bufferWidth = 2048, int bufferHeight = 1536,
         int previewWidth = 2048, int previewHeight = 1536)
     {
-        // Optional B0 pattern probe only. B1/production Surface is exp_Image=1.
-        int probeMode = Robot.SurfaceEncodeProbe.ResolveMode();
-        if (probeMode == Robot.SurfaceEncodeProbe.ModePatternB0)
-        {
-            _useSurfaceProbe = true;
-            _useApiCapture = false;
-            LogWindow.Warn("SurfaceEncodeProbe B0 pattern — skipping Vision/for4U.");
-            SetRecordStatus("B0…");
-            _surfaceProbe.BeginPattern(this, fps, onTrackingData);
-            return;
-        }
-
         _useSurfaceProbe = false;
         if (expImage == 1)
         {
-            _useApiCapture = false;
             _useSurfaceProbe = true;
             int surfaceFps = targetFps == 60 ? 60 : 30;
             int surfaceBitrate = bitrate > 0 ? bitrate : Robot.SurfaceEncodeProbe.DefaultBitrateBps;
@@ -461,7 +432,6 @@ public partial class UICameraCtrl : MonoBehaviour
             return;
         }
 
-        _useApiCapture = false;
         LogWindow.Info("Starting Vision StartRecord (exp_Image=0) " + width + "x" + height + "@" + fps);
         SetRecordStatus("Vision…");
         _session.Begin(this, width, height, fps, bitrate, true, onTrackingData);
@@ -508,12 +478,6 @@ public partial class UICameraCtrl : MonoBehaviour
             return;
         }
 
-        if (_apiSession.IsActive)
-        {
-            _apiSession.RequestStop("user");
-            return;
-        }
-
         if (_session.IsActive)
         {
             _session.RequestStop("user");
@@ -551,17 +515,6 @@ public partial class UICameraCtrl : MonoBehaviour
             return;
         }
 
-        if (_useApiCapture || _apiSession.IsActive)
-        {
-            _apiSession.Pump();
-            if (_apiSession.TrackingWriteEnabled)
-            {
-                _apiSession.WriteTrackingSample();
-            }
-
-            return;
-        }
-
         _session.Pump();
         if (_recordTrackingData)
         {
@@ -579,11 +532,6 @@ public partial class UICameraCtrl : MonoBehaviour
         if (_surfaceProbe.IsActive)
         {
             _surfaceProbe.RequestStop("application paused");
-        }
-
-        if (_apiSession.IsActive)
-        {
-            _apiSession.RequestStop("application paused");
         }
 
         if (_session.IsActive)

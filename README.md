@@ -151,16 +151,16 @@ Official SDK for PICO device integration:
 ## Project Configuration
 
 ### Environment Requirements
-- Unity 2022.3.16f1+
+- Unity 2022.3.26f1c1 (project `ProjectVersion.txt`)
 - Android Studio 4.2.2+
-- Android SDK 29
-- Android NDK 21.4.7075529
-- PICO Integration SDK (com.unity.xr.picoxr) 3.1.2
+- Android minSdk 30 / targetSdk 31
+- Android NDK 21.4.7075529 (or the NDK bundled with the Unity Android module)
+- PICO Integration SDK (`com.unity.xr.picoxr`) **3.4.0** (vendored under `PICO Unity Integration SDK/`)
 
 ⚠️ **Important Notes**:
-1. Use exact Unity version 2022.3.16f1 to avoid compatibility issues
+1. Prefer Unity 2022.3.26f1c1 to match this repo; other 2022.3.x builds may work but are unverified
 2. Verify Android SDK/NDK paths in Unity Preferences
-3. Ensure PICO SDK compatibility with Unity version
+3. Ensure PICO SDK 3.4.0 / Enterprise APIs match the headset firmware
 4. Complete Android module installation during Unity setup
 
 ### APK Build Process

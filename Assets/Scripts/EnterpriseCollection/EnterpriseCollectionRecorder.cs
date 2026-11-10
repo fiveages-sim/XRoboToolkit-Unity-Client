@@ -15,10 +15,6 @@ namespace Robot
     public class EnterpriseCollectionRecorder : MonoBehaviour
     {
         private const string Tag = "EnterpriseCollectionRecorder";
-        private const string EnterpriseHeadFile = "enterprise_head.jsonl";
-        private const string EnterpriseControllerFile = "enterprise_controller_pose.jsonl";
-        private const string UnityHeadFile = "unity_head.jsonl";
-        private const string UnityControllerFile = "unity_controller_pose.jsonl";
         private const double MaxValidEnterpriseControllerPositionMeters = 10.0;
         public const string InvalidControllerPose = "0,0,0,0,0,0,1";
         private static bool s_enterpriseServiceBound;
@@ -52,10 +48,15 @@ namespace Robot
         private readonly ControllerLogState _enterpriseRightControllerLog = new ControllerLogState("enterprise", "right");
 
         private Thread _enterpriseThread;
-        private EnterpriseCollectionFileWriter _fileWriter;
+        private CollectionSessionWriter _sessionWriter;
+        private readonly TrackingData _auxTrackingData = new TrackingData();
+        private TrackingConfigSnapshot _collectionSnapshot;
         private volatile bool _recording;
         private long _enterpriseHeadSeq;
         private long _enterpriseControllerSeq;
+        private long _handSeq;
+        private long _bodySeq;
+        private long _motionSeq;
         private long _unityHeadSeq;
         private long _unityControllerSeq;
         private double _nextUnitySampleTimeSeconds;
@@ -131,21 +132,7 @@ namespace Robot
             if (!_recordTimeLimitReached && maxRecordSeconds > 0 && _stopwatch.Elapsed.TotalSeconds >= maxRecordSeconds)
             {
                 _recordTimeLimitReached = true;
-                StopFileWriter("record time limit reached");
-            }
-
-            double nowSeconds = Time.realtimeSinceStartup;
-            if (nowSeconds < _nextUnitySampleTimeSeconds)
-            {
-                return;
-            }
-
-            double intervalSeconds = GetIntervalSeconds(unitySampleHz);
-            _nextUnitySampleTimeSeconds = nowSeconds + intervalSeconds;
-
-            if (collectHeadPose)
-            {
-                Enqueue(UnityHeadFile, BuildUnityHeadLine());
+                StopFileWriter("record time limit reached", "aborted_user", "timeout");
             }
         }
 
@@ -162,21 +149,17 @@ namespace Robot
                 return;
             }
 
-            _fileWriter = new EnterpriseCollectionFileWriter(enableFileWrite, Application.persistentDataPath);
-            _fileWriter.Start(new EnterpriseCollectionFileWriter.Meta
-            {
-                EnableFileWrite = enableFileWrite,
-                CollectHeadPose = collectHeadPose,
-                CollectControllerPose = collectControllerPose,
-                EnterpriseSampleHz = enterpriseSampleHz,
-                UnitySampleHz = unitySampleHz,
-                MaxRecordSeconds = maxRecordSeconds,
-                UseDynamicPredictedDisplayTimeForEnterpriseHead = useDynamicPredictedDisplayTimeForEnterpriseHead,
-                EnterpriseHeadPredictTimeMode = useDynamicPredictedDisplayTimeForEnterpriseHead
-                    ? "dynamic"
-                    : "sample_interval",
-                EnterpriseControllerPredictTimeMode = "latest"
-            });
+            _collectionSnapshot = TrackingConfigSnapshot.CaptureFromPanel();
+            string rootParent = GetCollectionRootParent();
+            _sessionWriter = new CollectionSessionWriter(enableFileWrite, rootParent);
+            _sessionWriter.Start(
+                _collectionSnapshot,
+                EnterpriseSampleHz,
+                unitySampleHz,
+                false,
+                SystemInfo.deviceModel,
+                Utils.IsPico4U());
+            TrackingConfigLock.Lock(_collectionSnapshot, OnLockedConfigChangeAttempt);
 
             _recording = true;
             _stopwatch.Restart();
@@ -186,6 +169,9 @@ namespace Robot
             _lastEnterpriseHeadSampleTicks = 0;
             _lastEnterpriseRateLogTicks = Stopwatch.GetTimestamp();
             _recordTimeLimitReached = false;
+            _handSeq = 0;
+            _bodySeq = 0;
+            _motionSeq = 0;
 
             _enterpriseThread = new Thread(EnterpriseLoop)
             {
@@ -194,11 +180,27 @@ namespace Robot
             };
             _enterpriseThread.Start();
 
-            Debug.Log($"{Tag} started: {_fileWriter.RecordDir}, enableFileWrite={enableFileWrite}, " +
-                $"collectHeadPose={collectHeadPose}, collectControllerPose={collectControllerPose}");
-            string startMsg = "EnterpriseCollection started dir=" + _fileWriter.RecordDir;
+            Debug.Log($"{Tag} started: {_sessionWriter.SessionDir}, enableFileWrite={enableFileWrite}, " +
+                      $"snapshot head={_collectionSnapshot.Head} controller={_collectionSnapshot.Controller} " +
+                      $"hand={_collectionSnapshot.Hand} body={_collectionSnapshot.FullBody} " +
+                      $"motion={_collectionSnapshot.MotionTracker}");
+            string startMsg = "CameraCollection started dir=" + _sessionWriter.SessionDir;
             LogWindow.Info(startMsg);
-            Toast.Show(enableFileWrite ? "EnterpriseCollection started" : "EnterpriseCollection started (no file write)");
+            Toast.Show(enableFileWrite ? "CameraCollection started" : "CameraCollection started (no file write)");
+        }
+
+        private void OnLockedConfigChangeAttempt(string change, bool applied, string reason)
+        {
+            _sessionWriter?.RecordConfigChange(change, applied, reason);
+        }
+
+        private static string GetCollectionRootParent()
+        {
+#if UNITY_ANDROID && !UNITY_EDITOR
+            return "/sdcard/Download";
+#else
+            return Application.persistentDataPath;
+#endif
         }
 
         private void TryAutoStart()
@@ -228,18 +230,19 @@ namespace Robot
             }
 
             Stopwatch stopProfile = Stopwatch.StartNew();
-            int pendingBeforeStop = _fileWriter != null ? _fileWriter.PendingCount : 0;
+            int pendingBeforeStop = _sessionWriter != null ? _sessionWriter.PendingCount : 0;
             _recording = false;
 
             Stopwatch stageProfile = Stopwatch.StartNew();
             _enterpriseThread?.Join(1000);
             long enterpriseJoinMs = stageProfile.ElapsedMilliseconds;
 
-            EnterpriseCollectionFileWriter.StopStats writerStats = _fileWriter != null
-                ? _fileWriter.Stop(2000)
-                : new EnterpriseCollectionFileWriter.StopStats();
-            string recordDir = _fileWriter != null ? _fileWriter.RecordDir : "none";
-            _fileWriter = null;
+            TrackingConfigLock.Unlock();
+            CollectionSessionWriter.StopStats writerStats = _sessionWriter != null
+                ? _sessionWriter.Stop("completed", "user", "none", "", 2000)
+                : new CollectionSessionWriter.StopStats();
+            string recordDir = writerStats.SessionDir ?? "none";
+            _sessionWriter = null;
 
             _stopwatch.Stop();
             ClearLatestEnterpriseHead();
@@ -252,23 +255,25 @@ namespace Robot
                 $"pendingBeforeStop={pendingBeforeStop}, pendingAfterStop={writerStats.PendingAfterStop}, " +
                 $"enterpriseThreadAlive={(_enterpriseThread != null && _enterpriseThread.IsAlive)}, " +
                 $"writerThreadAlive={writerStats.WriterThreadAlive}");
-            string savedMsg = "EnterpriseCollection saved dir=" + recordDir +
+            string savedMsg = "CameraCollection saved dir=" + recordDir +
                               " pendingAfterStop=" + writerStats.PendingAfterStop;
             LogWindow.Info(savedMsg);
-            Toast.Show("EnterpriseCollection saved");
+            Toast.Show("CameraCollection saved");
         }
 
-        private void StopFileWriter(string reason)
+        private void StopFileWriter(string reason, string status, string interruptKind)
         {
-            if (_fileWriter == null)
+            if (_sessionWriter == null)
             {
                 return;
             }
 
-            int pendingBeforeStop = _fileWriter.PendingCount;
-            string recordDir = _fileWriter.RecordDir;
-            EnterpriseCollectionFileWriter.StopStats writerStats = _fileWriter.Stop(2000);
-            _fileWriter = null;
+            int pendingBeforeStop = _sessionWriter.PendingCount;
+            string recordDir = _sessionWriter.SessionDir;
+            CollectionSessionWriter.StopStats writerStats =
+                _sessionWriter.Stop(status, reason, interruptKind, reason, 2000);
+            _sessionWriter = null;
+            TrackingConfigLock.Unlock();
             Debug.Log($"{Tag} file writer stopped: {recordDir}, reason={reason}");
             Debug.Log($"{Tag} file writer stop profile: writerJoinMs={writerStats.WriterJoinMs}, " +
                 $"closeWritersMs={writerStats.CloseWritersMs}, " +
@@ -293,16 +298,45 @@ namespace Robot
                     continue;
                 }
 
-                // Match UnityXR panel semantics: closed toggle means no sample and no send.
+                // File writes follow the start snapshot. TCP cache refresh follows live panel.
                 bool sendOn = TcpHandler.SendTrackingData;
-                if (collectHeadPose && sendOn && TrackingData.HeadOn)
+                bool writeHead = _collectionSnapshot.Head;
+                bool refreshHeadTcp = collectHeadPose && sendOn && TrackingData.HeadOn;
+                if (writeHead || refreshHeadTcp)
                 {
-                    Enqueue(EnterpriseHeadFile, BuildEnterpriseHeadLine());
+                    // Only build the jsonl line when it is actually written; the TCP cache
+                    // refresh needs the sample, not a serialized envelope.
+                    string headLine = BuildEnterpriseHeadLine(writeHead, out bool headOk);
+                    if (writeHead)
+                    {
+                        EnqueueSource("head", headLine, headOk);
+                    }
                 }
 
-                if (collectControllerPose && sendOn && TrackingData.ControllerOn)
+                bool writeController = _collectionSnapshot.Controller;
+                bool refreshControllerTcp = collectControllerPose && sendOn && TrackingData.ControllerOn;
+                if (writeController || refreshControllerTcp)
                 {
-                    Enqueue(EnterpriseControllerFile, BuildEnterpriseControllerLine());
+                    string controllerLine = BuildEnterpriseControllerLine(writeController, out bool controllerOk);
+                    if (writeController)
+                    {
+                        EnqueueSource("controller", controllerLine, controllerOk);
+                    }
+                }
+
+                if (_collectionSnapshot.Hand)
+                {
+                    WriteHandSample();
+                }
+
+                if (_collectionSnapshot.FullBody)
+                {
+                    WriteBodySample();
+                }
+
+                if (_collectionSnapshot.MotionTracker)
+                {
+                    WriteMotionSample();
                 }
 
                 LogEnterpriseSampleRateIfNeeded();
@@ -388,7 +422,7 @@ namespace Robot
             }
         }
 
-        private string BuildEnterpriseHeadLine()
+        private string BuildEnterpriseHeadLine(bool buildPayload, out bool success)
         {
             try
             {
@@ -401,6 +435,18 @@ namespace Robot
                     ref sensorState,
                     ref sensorFrameIndex);
 
+                success = result == 0;
+                if (success)
+                {
+                    Interlocked.Increment(ref _enterpriseHeadSamplesInWindow);
+                    UpdateLatestEnterpriseHead(sensorState);
+                }
+
+                if (!buildPayload)
+                {
+                    return null;
+                }
+
                 JsonData data = BuildUnityHeadJson(sensorState);
                 data["sensorFrameIndex"] = sensorFrameIndex;
                 data["predictTimeMs"] = predictTimeMs;
@@ -408,18 +454,16 @@ namespace Robot
                     ? "dynamic"
                     : "sample_interval";
                 data["nativeResult"] = result;
-                if (result == 0)
-                {
-                    Interlocked.Increment(ref _enterpriseHeadSamplesInWindow);
-                    UpdateLatestEnterpriseHead(sensorState);
-                }
-                return BuildEnvelope("enterprise", "head", Interlocked.Increment(ref _enterpriseHeadSeq),
-                    result == 0, data, null);
+                return BuildEnvelope("enterprise", "head_pose", Interlocked.Increment(ref _enterpriseHeadSeq),
+                    success, data, null);
             }
             catch (Exception e)
             {
-                return BuildEnvelope("enterprise", "head", Interlocked.Increment(ref _enterpriseHeadSeq),
-                    false, null, e.GetType().Name + ": " + e.Message);
+                success = false;
+                return buildPayload
+                    ? BuildEnvelope("enterprise", "head_pose", Interlocked.Increment(ref _enterpriseHeadSeq),
+                        false, null, e.GetType().Name + ": " + e.Message)
+                    : null;
             }
         }
 
@@ -441,29 +485,40 @@ namespace Robot
             return (nowTicks - previousTicks) * 1000.0 / Stopwatch.Frequency;
         }
 
-        private string BuildEnterpriseControllerLine()
+        private string BuildEnterpriseControllerLine(bool buildPayload, out bool success)
         {
             try
             {
                 double predictTimeMs = GetEnterpriseControllerPredictTimeMs();
                 PoseInfo[] poses = PXR_Enterprise.GetControllerPose(predictTimeMs);
-                if (poses != null)
+                success = poses != null;
+                if (success)
                 {
                     Interlocked.Increment(ref _enterpriseControllerSamplesInWindow);
                     UpdateLatestEnterpriseController(poses);
                 }
+
+                if (!buildPayload)
+                {
+                    return null;
+                }
+
                 JsonData data = new JsonData();
                 data["predictTimeMs"] = predictTimeMs;
                 data["predictTimeMode"] = "latest";
                 data["left"] = BuildEnterpriseControllerSide(poses, 0, _enterpriseLeftControllerLog);
                 data["right"] = BuildEnterpriseControllerSide(poses, 1, _enterpriseRightControllerLog);
                 return BuildEnvelope("enterprise", "controller_pose",
-                    Interlocked.Increment(ref _enterpriseControllerSeq), poses != null, data, null);
+                    Interlocked.Increment(ref _enterpriseControllerSeq), success, data, null);
             }
             catch (Exception e)
             {
-                return BuildEnvelope("enterprise", "controller_pose",
-                    Interlocked.Increment(ref _enterpriseControllerSeq), false, null, e.GetType().Name + ": " + e.Message);
+                success = false;
+                return buildPayload
+                    ? BuildEnvelope("enterprise", "controller_pose",
+                        Interlocked.Increment(ref _enterpriseControllerSeq), false, null,
+                        e.GetType().Name + ": " + e.Message)
+                    : null;
             }
         }
 
@@ -718,6 +773,8 @@ namespace Robot
                 s_latestEnterpriseHeadSampleSeq++;
                 s_hasLatestEnterpriseHead = true;
             }
+
+            TcpHandler.NotifyTrackingSampleAvailable();
         }
 
         private static void ClearLatestEnterpriseHead()
@@ -742,6 +799,8 @@ namespace Robot
                 s_latestEnterpriseControllerSampleSeq++;
                 s_hasLatestEnterpriseController = left.HasPose || right.HasPose;
             }
+
+            TcpHandler.NotifyTrackingSampleAvailable();
         }
 
         private static void ClearLatestEnterpriseController()
@@ -837,6 +896,67 @@ namespace Robot
             return json;
         }
 
+        private void WriteHandSample()
+        {
+            try
+            {
+                bool ok = _auxTrackingData.TryBuildHandJson(out JsonData handJson);
+                string line = BuildEnvelope("enterprise", "hand_pose",
+                    Interlocked.Increment(ref _handSeq), ok, handJson, ok ? null : "hand sample unavailable");
+                EnqueueSource("hand", line, ok);
+                if (!ok)
+                {
+                    _sessionWriter?.SetSourceAvailable("hand", false, "no hand joints this sample");
+                }
+                else
+                {
+                    _sessionWriter?.SetSourceAvailable("hand", true, "");
+                }
+            }
+            catch (Exception e)
+            {
+                string line = BuildEnvelope("enterprise", "hand_pose",
+                    Interlocked.Increment(ref _handSeq), false, null, e.GetType().Name + ": " + e.Message);
+                EnqueueSource("hand", line, false);
+            }
+        }
+
+        private void WriteBodySample()
+        {
+            try
+            {
+                bool ok = _auxTrackingData.TryBuildBodyJson(out JsonData bodyJson);
+                string line = BuildEnvelope("enterprise", "body_pose",
+                    Interlocked.Increment(ref _bodySeq), ok, bodyJson, ok ? null : "body sample unavailable");
+                EnqueueSource("full_body", line, ok);
+                _sessionWriter?.SetSourceAvailable("full_body", ok, ok ? "" : "body tracking invalid");
+            }
+            catch (Exception e)
+            {
+                string line = BuildEnvelope("enterprise", "body_pose",
+                    Interlocked.Increment(ref _bodySeq), false, null, e.GetType().Name + ": " + e.Message);
+                EnqueueSource("full_body", line, false);
+            }
+        }
+
+        private void WriteMotionSample()
+        {
+            try
+            {
+                bool ok = _auxTrackingData.TryBuildMotionJson(out JsonData motionJson);
+                string line = BuildEnvelope("enterprise", "motion_tracker",
+                    Interlocked.Increment(ref _motionSeq), ok, motionJson, ok ? null : "motion sample unavailable");
+                EnqueueSource("motion_tracker", line, ok);
+                _sessionWriter?.SetSourceAvailable("motion_tracker", ok, ok ? "" : "no motion trackers");
+            }
+            catch (Exception e)
+            {
+                string line = BuildEnvelope("enterprise", "motion_tracker",
+                    Interlocked.Increment(ref _motionSeq), false, null, e.GetType().Name + ": " + e.Message);
+                EnqueueSource("motion_tracker", line, false);
+            }
+        }
+
         private string BuildEnvelope(string source, string kind, long seq, bool success, JsonData data, string error)
         {
             JsonData envelope = new JsonData();
@@ -845,6 +965,7 @@ namespace Robot
             envelope["seq"] = seq;
             envelope["captureElapsedMs"] = _stopwatch.ElapsedMilliseconds;
             envelope["captureUnixTimeMs"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            envelope["elapsedRealtimeNs"] = Utils.GetElapsedRealtimeNs();
             envelope["threadId"] = Thread.CurrentThread.ManagedThreadId;
             envelope["success"] = success;
             if (data != null)
@@ -860,9 +981,9 @@ namespace Robot
             return envelope.ToJson();
         }
 
-        private void Enqueue(string fileName, string line)
+        private void EnqueueSource(string sourceKey, string line, bool success)
         {
-            _fileWriter?.Enqueue(fileName, line);
+            _sessionWriter?.Enqueue(sourceKey, line, success);
         }
 
         private static double GetIntervalSeconds(int sampleHz)

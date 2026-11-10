@@ -49,39 +49,40 @@ namespace Network
             }
 
             int paramLength = BitConverter.ToInt32(paramLengthArray, 0);
+            if (paramLength < 0 || paramLength > arraySize)
+            {
+                return false;
+            }
 
-            byte[] body;
-            // params
-            if (arraySize > (5 + paramLength) && paramLength != 0)
+            // Full packet = head(1)+cmd(1)+len(4)+body(paramLength)+timestamp(8)+end(1)
+            if (arraySize < DEFAULT_PACKAGE_SIZE + paramLength)
+            {
+                return false;
+            }
+
+            byte[] body = null;
+            if (paramLength != 0)
             {
                 body = new byte[paramLength];
                 Array.Copy(data, 6, body, 0, paramLength);
             }
-            else
+
+            byte[] timeStampArray = new byte[8];
+            Array.Copy(data, 6 + paramLength, timeStampArray, 0, 8);
+            if (BigEndian)
             {
-                body = null;
+                Array.Reverse(timeStampArray);
             }
 
-            // timestamp
-            if (arraySize > 13 + paramLength)
-            {
-                byte[] timeStampArray = new byte[8];
-                if (BigEndian)
-                {
-                    Array.Reverse(timeStampArray);
-                }
-
-                Array.Copy(data, 6 + paramLength, timeStampArray, 0, 8);
-                long timeStamp = BitConverter.ToInt64(timeStampArray, 0);
-                byte end = data[paramLength + DEFAULT_PACKAGE_SIZE - 1];
-
-                package.SetData(cmd, body, timeStamp);
-                return true;
-            }
-            else
+            long timeStamp = BitConverter.ToInt64(timeStampArray, 0);
+            byte end = data[paramLength + DEFAULT_PACKAGE_SIZE - 1];
+            if (end != NetCMD.RECEIVE_PACKET_EDN)
             {
                 return false;
             }
+
+            package.SetData(cmd, body, timeStamp);
+            return true;
         }
 
         public static bool Unpack(ByteBuffer buffer, out NetPacket package)
@@ -102,17 +103,16 @@ namespace Network
 
             byte cmd = buffer.data[buffer.ReadIndex + 1];
             int length = BitConverter.ToInt32(buffer.data, buffer.ReadIndex + 2);
-            // length = IPAddress.NetworkToHostOrder(length);
 
-            Debug.Log("Receive:" + NetUtils.Get16String(cmd) + " length:" + length);
+            if (length < 0 || length > buffer.data.Length)
+            {
+                Debug.LogError("Receive data length error!" + length);
+                buffer.AddReadIndex(buffer.GetReadableCount());
+                return false;
+            }
+
             if (buffer.GetReadableCount() < 15 + length)
             {
-                if (length > buffer.data.Length)
-                {
-                    Debug.LogError("Receive data length error!" + length);
-                    buffer.AddReadIndex(buffer.GetReadableCount());
-                }
-
                 return false;
             }
 
@@ -128,8 +128,7 @@ namespace Network
             byte[] data = new byte[length];
             Buffer.BlockCopy(buffer.data, buffer.ReadIndex + 2 + 4, data, 0, length);
 
-            long timeStamp = BitConverter.ToInt32(buffer.data, buffer.ReadIndex + 2 + 4 + length);
-
+            long timeStamp = BitConverter.ToInt64(buffer.data, buffer.ReadIndex + 2 + 4 + length);
 
             buffer.AddReadIndex(2 + 4 + length + 8 + 1);
 

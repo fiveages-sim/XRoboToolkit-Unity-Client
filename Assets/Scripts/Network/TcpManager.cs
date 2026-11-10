@@ -53,10 +53,8 @@ namespace Robot.V2.Network
             tcpClient.OnDataReceived += TcpClientOnOnDataReceived;
             tcpClient.OnError += TcpClientOnOnError;
 
-#if !UNITY_EDITOR
-            // Start server by default
-            StartServer();
-#endif
+            // Do not open inbound 13579 by default. Remote-camera flow uses
+            // TcpClient + UDP listen; call StartServer() explicitly if needed.
         }
 
         private void OnDestroy()

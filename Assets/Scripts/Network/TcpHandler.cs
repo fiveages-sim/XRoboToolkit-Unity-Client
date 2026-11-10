@@ -30,13 +30,14 @@ namespace Robot
         public static event ReceiveMassage ReceiveEvent;
         public static event ReceiveFunctionMsg ReceiveFunctionEvent;
 
-        public static bool SendTrackingData = false;
-        public static bool EnterpriseDirectTrackingEnabled = true;
+        public static volatile bool SendTrackingData = false;
+        public static volatile bool EnterpriseDirectTrackingEnabled = true;
         private static object _sendObject = new object();
-        private Queue<NetPacket> _receivePackages = new Queue<NetPacket>();
+        private readonly ConcurrentQueue<NetPacket> _receivePackages = new ConcurrentQueue<NetPacket>();
         private static readonly ConcurrentQueue<SendData> _sendDatas = new ConcurrentQueue<SendData>();
 
         private Socket _socket;
+        private int _connectionGeneration;
         private SocketState _state = SocketState.NONE;
 
         private bool _connectInited = false;
@@ -45,14 +46,40 @@ namespace Robot
         private int _port = 8888; //PC Port
         private int _sendTimeout = 15000; // timeout
         [SerializeField] private int trackingThreadIdleSleepMs = 5;
-        [SerializeField] private int trackingThreadWaitForHeadSleepMs = 1;
-        [SerializeField] private int trackingThreadQueueBackpressureSleepMs = 1;
+        [SerializeField] private int trackingThreadWaitForHeadSleepMs = 5;
+        [SerializeField] private int trackingThreadQueueBackpressureSleepMs = 5;
+        // Max block when waiting for the next sample event (not a rate limiter).
+        [SerializeField] private int trackingThreadSampleWaitTimeoutMs = 5;
+        // Brief spin before WaitOne so a same-timeslice Publish does not always sleep.
+        [SerializeField] private int trackingThreadWakeSpinUs = 50;
         [SerializeField] private bool outputTrackingRateToLogWindow = false;
         [SerializeField] private float trackingRateLogIntervalSeconds = 1f;
         [SerializeField] private bool outputEnterpriseControllerPayloadToLog = false;
         [SerializeField] private float enterpriseControllerPayloadLogIntervalSeconds = 1f;
+        /// <summary>
+        /// B0: only attach sources whose seq advanced since last sent packet. Missing key =
+        /// fa-py keeps previous cache. false = official always-bundle of enabled sources.
+        /// </summary>
+        [SerializeField] private bool omitUnchangedSources = true;
+        /// <summary>
+        /// When over bandwidthBudgetKiBps (or pending stuck), lower Hand/Body/Motion sample
+        /// caps first; Head packet rate is never reduced here.
+        /// </summary>
+        [SerializeField] private bool autoThrottleEnabled = true;
+        [SerializeField] private float bandwidthBudgetKiBps = 1200f;
+        [SerializeField] private float bandwidthRecoverMarginKiBps = 250f;
+        // Start at panel-class rate; auto-throttle steps down under bandwidth pressure.
+        [SerializeField] private int auxThrottleMaxHz = 400;
+        [SerializeField] private int auxThrottleMinHz = 15;
+        [SerializeField] private int auxThrottleStepHz = 25;
         private Thread _sendThread;
         private Thread _trackingThread;
+        private static readonly AutoResetEvent s_sendSignal = new AutoResetEvent(false);
+        // Sample threads Set this; OnTrackingThread waits instead of Sleep-polling.
+        private static readonly AutoResetEvent s_trackingSampleSignal = new AutoResetEvent(false);
+        private static int s_omitUnchangedSources = 1;
+        private static int s_autoThrottleEnabled = 1;
+        private static int s_auxThrottleHz = 400;
         private ByteBuffer receiveBuffer;
         private string _appVersion = "";
         private string _deviceSN = "";
@@ -76,6 +103,7 @@ namespace Robot
         private bool _reconnectEnable = false;
         private readonly System.Diagnostics.Stopwatch _trackingRateStopwatch = new System.Diagnostics.Stopwatch();
         private int _trackingPacketsSentInWindow = 0;
+        private long _trackingBytesSentInWindow = 0;
         private string _lastTrackingSendMode = "idle";
         private string _lastDirectTrackingGateStatus;
         private long _lastEnterpriseControllerPayloadLogTicks;
@@ -93,6 +121,48 @@ namespace Robot
             _sendThread = new Thread(OnSendThread);
             _trackingThread = new Thread(OnTrackingThread);
             _trackingRateStopwatch.Start();
+            ApplyTrackingSendPolicy();
+        }
+
+        private void OnValidate()
+        {
+            ApplyTrackingSendPolicy();
+        }
+
+        private void ApplyTrackingSendPolicy()
+        {
+            Volatile.Write(ref s_omitUnchangedSources, omitUnchangedSources ? 1 : 0);
+            Volatile.Write(ref s_autoThrottleEnabled, autoThrottleEnabled ? 1 : 0);
+            int maxHz = Mathf.Clamp(auxThrottleMaxHz, 1, 1000);
+            int minHz = Mathf.Clamp(auxThrottleMinHz, 1, maxHz);
+            auxThrottleMaxHz = maxHz;
+            auxThrottleMinHz = minHz;
+            int cur = Volatile.Read(ref s_auxThrottleHz);
+            // Clamp into range; prefer max when unset/stale so Hand can track panel until budget bites.
+            if (cur < minHz || cur > maxHz || cur == 0)
+            {
+                Volatile.Write(ref s_auxThrottleHz, maxHz);
+            }
+        }
+
+        private void Start()
+        {
+            // Fresh run: begin at max aux rate; auto-throttle steps down if needed.
+            Volatile.Write(ref s_auxThrottleHz, Mathf.Clamp(auxThrottleMaxHz, 1, 1000));
+            ApplyTrackingSendPolicy();
+        }
+
+        public static bool OmitUnchangedSourcesEnabled
+        {
+            get { return Volatile.Read(ref s_omitUnchangedSources) != 0; }
+        }
+
+        /// <summary>
+        /// Dynamic cap for Hand/Body/Motion sampling (auto-throttle). Head unaffected.
+        /// </summary>
+        public static int SharedAuxThrottleHz
+        {
+            get { return Math.Max(1, Volatile.Read(ref s_auxThrottleHz)); }
         }
 
         public SocketState State
@@ -133,42 +203,71 @@ namespace Robot
         private void Connect()
         {
             _port = TCP_PORT;
-            _state = SocketState.CREATE;
             ConnectErrorInfo = "";
+            int generation;
+            Socket previous;
+            lock (_sendObject)
+            {
+                generation = ++_connectionGeneration;
+                _state = SocketState.CREATE;
+                _connectInited = false;
+                previous = _socket;
+                _socket = null;
+            }
+
+            DisposeSocket(previous);
             Debug.Log(
                 $"{Tag}connect to server: source " +
                 $"{(string.IsNullOrEmpty(_localAddress) ? "auto" : _localAddress)} " +
-                $"target {_address} port {_port}");
-            IPAddress ia = IPAddress.Parse(_address);
+                $"target {_address} port {_port} generation {generation}");
+
+            Socket socket = null;
             try
             {
-                if (_state != SocketState.CLOSE)
+                IPAddress ia = IPAddress.Parse(_address);
+                socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                socket.Blocking = true;
+                socket.SendTimeout = _sendTimeout;
+                socket.NoDelay = true;
+                socket.ReceiveTimeout = RECEIVE_TIME_OUT_DEFAULT;
+                if (!string.IsNullOrEmpty(_localAddress))
                 {
-                    Close();
+                    IPAddress localIp = IPAddress.Parse(_localAddress);
+                    socket.Bind(new IPEndPoint(localIp, 0));
                 }
 
+                bool stillCurrent;
                 lock (_sendObject)
                 {
-                    _socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-                    _socket.Blocking = true;
-                    _socket.SendTimeout = _sendTimeout;
-                    _socket.NoDelay = true;
-                    _socket.ReceiveTimeout = RECEIVE_TIME_OUT_DEFAULT;
-                    if (!string.IsNullOrEmpty(_localAddress))
+                    stillCurrent = _connectionGeneration == generation;
+                    if (stillCurrent)
                     {
-                        IPAddress localIp = IPAddress.Parse(_localAddress);
-                        _socket.Bind(new IPEndPoint(localIp, 0));
+                        _socket = socket;
+                        _state = SocketState.CONNECTING;
                     }
-
-
-                    _state = SocketState.CONNECTING;
-                    _socket.BeginConnect(ia, _port, ConnectCallback, _socket);
                 }
+
+                if (!stillCurrent)
+                {
+                    DisposeSocket(socket);
+                    return;
+                }
+
+                socket.BeginConnect(ia, _port, ConnectCallback, new IoAttempt(generation, socket));
             }
-            catch (SocketException e)
+            catch (Exception e)
             {
-                _state = SocketState.CONNECT_ERROR;
-                ConnectErrorInfo = e.Message;
+                DisposeSocket(socket);
+                lock (_sendObject)
+                {
+                    if (_connectionGeneration == generation)
+                    {
+                        _socket = null;
+                        _state = SocketState.CONNECT_ERROR;
+                        ConnectErrorInfo = e.Message;
+                    }
+                }
+
                 LogWindow.Error($"TCP connection failed: {e.Message}");
                 Debug.LogError(Tag + "Connection failed: " + e.Message);
             }
@@ -176,52 +275,90 @@ namespace Robot
 
         private void ConnectCallback(IAsyncResult async)
         {
+            var attempt = (IoAttempt)async.AsyncState;
             try
             {
-                Socket socket = (Socket)async.AsyncState;
-                if (socket.Connected)
+                attempt.Socket.EndConnect(async);
+                bool currentAndConnected;
+                lock (_sendObject)
                 {
-                    _reconnectEnable = true;
-                    socket.EndConnect(async);
-                    _state = SocketState.WORKING;
-                    LogWindow.Info("TCP socket connection established successfully");
-
-                    if (_sendThread.ThreadState == ThreadState.Unstarted)
+                    currentAndConnected = IsCurrentAttemptLocked(attempt) && attempt.Socket.Connected;
+                    if (currentAndConnected)
                     {
-                        _sendThread.Start();
+                        _reconnectEnable = true;
+                        _state = SocketState.WORKING;
+                        _connectInited = false;
                     }
-
-                    if (_trackingThread.ThreadState == ThreadState.Unstarted)
+                    else if (IsCurrentAttemptLocked(attempt))
                     {
-                        _trackingThread.Start();
+                        _state = SocketState.CONNECT_ERROR;
+                        ConnectErrorInfo = "connect error";
                     }
-
-                    receiveBuffer = new ByteBuffer(BUFFER_LEN);
-                    socket.BeginReceive(receiveBuffer.data, receiveBuffer.GetReadableCount(),
-                        receiveBuffer.GetRemainCapacity(), SocketFlags.None, OnDataReceived,
-                        socket);
-                    _connectInited = false;
-                    if (!string.IsNullOrEmpty(_deviceSN))
-                    {
-                        ConnectInit();
-                    }
-
-                    Debug.Log(Tag + "Socket Connected!  ");
                 }
-                else
+
+                if (!currentAndConnected)
                 {
-                    _state = SocketState.CONNECT_ERROR;
-                    ConnectErrorInfo = "connect error";
-                    LogWindow.Error("TCP connection failed - socket not connected");
-                    Debug.LogError(Tag + "connect Error");
+                    if (attempt.Generation == _connectionGeneration)
+                    {
+                        LogWindow.Error("TCP connection failed - socket not connected");
+                        Debug.LogError(Tag + "connect Error");
+                    }
+
+                    return;
                 }
+
+                if (!IsCurrentAttempt(attempt))
+                {
+                    return;
+                }
+
+                LogWindow.Info("TCP socket connection established successfully");
+                if (_sendThread.ThreadState == ThreadState.Unstarted)
+                {
+                    _sendThread.Start();
+                }
+
+                if (_trackingThread.ThreadState == ThreadState.Unstarted)
+                {
+                    _trackingThread.Start();
+                }
+
+                receiveBuffer = new ByteBuffer(BUFFER_LEN);
+                if (!IsCurrentAttempt(attempt))
+                {
+                    return;
+                }
+
+                attempt.Socket.BeginReceive(receiveBuffer.data, receiveBuffer.GetReadableCount(),
+                    receiveBuffer.GetRemainCapacity(), SocketFlags.None, OnDataReceived,
+                    attempt);
+                if (!string.IsNullOrEmpty(_deviceSN))
+                {
+                    ConnectInit();
+                }
+
+                Debug.Log(Tag + "Socket Connected!  ");
             }
             catch (Exception e)
             {
-                ConnectErrorInfo = e.ToString();
+                bool current;
+                lock (_sendObject)
+                {
+                    current = IsCurrentAttemptLocked(attempt);
+                    if (current)
+                    {
+                        ConnectErrorInfo = e.Message;
+                        _state = SocketState.CONNECT_ERROR;
+                    }
+                }
+
+                if (!current)
+                {
+                    return;
+                }
+
                 LogWindow.Error($"TCP connection exception: {e.Message}");
                 Debug.LogError(Tag + "Connect error,Exception " + e);
-                _state = SocketState.CONNECT_ERROR;
             }
         }
 
@@ -244,15 +381,37 @@ namespace Robot
 
         private void OnDataReceived(IAsyncResult ar)
         {
-            if (_state != SocketState.WORKING)
+            var attempt = ar.AsyncState as IoAttempt;
+            if (attempt == null)
             {
                 return;
             }
 
-            var socket = (Socket)ar.AsyncState;
+            int bytesRead;
             try
             {
-                int bytesRead = socket.EndReceive(ar);
+                bytesRead = attempt.Socket.EndReceive(ar);
+            }
+            catch (Exception ex)
+            {
+                if (!IsCurrentAttempt(attempt))
+                {
+                    return;
+                }
+
+                LogWindow.Error($"TCP data receive error: {ex.Message}");
+                Debug.LogError($"Error: {ex.Message}");
+                CloseIfCurrent(attempt.Generation);
+                return;
+            }
+
+            if (!IsCurrentAttempt(attempt) || _state != SocketState.WORKING)
+            {
+                return;
+            }
+
+            try
+            {
                 if (bytesRead > 0)
                 {
                     receiveBuffer.AddWriteIndex(bytesRead);
@@ -264,8 +423,8 @@ namespace Robot
                         {
                             if (package.Cmd == NetCMD.PACKET_CMD_FROM_CONTROLLER_COMMON_FUNCTION)
                             {
-                                Debug.Log("receive function:" + package.ToString());
-                                if (package.ToString().Contains("timeTest"))
+                                string content = package.ToString();
+                                if (content != null && content.Contains("timeTest"))
                                 {
                                     Send(NetCMD.PACKET_CCMD_TO_CONTROLLER_FUNCTION, "timeTest");
                                 }
@@ -277,23 +436,32 @@ namespace Robot
 
                     receiveBuffer.RemoveReadedBytes();
 
-                    // Continue receiving data
-                    socket.BeginReceive(receiveBuffer.data, receiveBuffer.GetReadableCount(),
+                    if (!IsCurrentAttempt(attempt))
+                    {
+                        return;
+                    }
+
+                    attempt.Socket.BeginReceive(receiveBuffer.data, receiveBuffer.GetReadableCount(),
                         receiveBuffer.GetRemainCapacity(), SocketFlags.None, OnDataReceived,
-                        socket);
+                        attempt);
                 }
                 else
                 {
                     LogWindow.Warn("TCP client disconnected - no data received");
                     Debug.Log("Client disconnected.");
-                    Close();
+                    CloseIfCurrent(attempt.Generation);
                 }
             }
             catch (Exception ex)
             {
+                if (!IsCurrentAttempt(attempt))
+                {
+                    return;
+                }
+
                 LogWindow.Error($"TCP data receive error: {ex.Message}");
                 Debug.LogError($"Error: {ex.Message}");
-                Close();
+                CloseIfCurrent(attempt.Generation);
             }
         }
 
@@ -311,23 +479,39 @@ namespace Robot
         public static void Send(byte cmd, string msg)
         {
             _sendDatas.Enqueue(new SendData(cmd, Encoding.UTF8.GetBytes(msg)));
+            s_sendSignal.Set();
         }
 
         public static void SendCustomData(byte[] msg)
         {
             _sendDatas.Enqueue(new SendData(NetCMD.PACKET_CMD_CUSTOM_TO_PC, msg));
+            s_sendSignal.Set();
         }
 
         private void Update()
         {
             _cachedAppFocus = Application.isFocused;
             _cachedActiveInputDevice = (int)PXR_HandTracking.GetActiveInputDevice();
-            ControllerInputState leftInput = ReadControllerInput(XRNode.LeftHand);
-            ControllerInputState rightInput = ReadControllerInput(XRNode.RightHand);
-            lock (_controllerInputLock)
+            bool captureControllerInput = SendTrackingData &&
+                                          TrackingData.ControllerOn &&
+                                          TrackingDataSourceCtrl.UseEnterpriseSDK;
+            if (captureControllerInput)
             {
-                _cachedLeftControllerInput = leftInput;
-                _cachedRightControllerInput = rightInput;
+                ControllerInputState leftInput = ReadControllerInput(XRNode.LeftHand);
+                ControllerInputState rightInput = ReadControllerInput(XRNode.RightHand);
+                lock (_controllerInputLock)
+                {
+                    _cachedLeftControllerInput = leftInput;
+                    _cachedRightControllerInput = rightInput;
+                }
+            }
+            else
+            {
+                lock (_controllerInputLock)
+                {
+                    _cachedLeftControllerInput = default(ControllerInputState);
+                    _cachedRightControllerInput = default(ControllerInputState);
+                }
             }
 
             if (SendTrackingData && !ShouldSendEnterpriseTrackingDirectly())
@@ -352,7 +536,9 @@ namespace Robot
                 }
             }
 
-            if (_reconnectEnable)
+            // USB binds a source address and is retried by UIOperate. This loop only
+            // covers a manually entered route, so the two retries cannot close each other.
+            if (_reconnectEnable && string.IsNullOrEmpty(_localAddress))
             {
                 if (State == SocketState.CLOSE || State == SocketState.CONNECT_ERROR)
                 {
@@ -372,47 +558,38 @@ namespace Robot
 
         private void ReceivePacketHandle()
         {
-            lock (_receivePackages)
+            while (_receivePackages.TryDequeue(out NetPacket packet))
             {
-                while (_receivePackages.Count > 0)
+                try
                 {
-                    try
+                    if (packet.Cmd == NetCMD.PACKET_CMD_FROM_CONTROLLER_COMMON_FUNCTION)
                     {
-                        NetPacket packet = _receivePackages.Dequeue();
-
-                        if (packet.Cmd == NetCMD.PACKET_CMD_FROM_CONTROLLER_COMMON_FUNCTION)
+                        string content = packet.ToString();
+                        if (string.IsNullOrEmpty(content))
                         {
-                            string content = packet.ToString();
-                            if (string.IsNullOrEmpty(content))
-                            {
-                                continue;
-                            }
-
-                            JsonData json = JsonMapper.ToObject(content);
-                            if (!json.ContainsKey("functionName") || !json.ContainsKey("value"))
-                            {
-                                continue;
-                            }
-
-                            string functionName = json["functionName"].ToString();
-                            Debug.Log("Receive functionName:" + functionName);
-                            if (ReceiveFunctionEvent != null)
-                            {
-                                ReceiveFunctionEvent.Invoke(functionName, json["value"].ToString());
-                            }
+                            continue;
                         }
-                        else
+
+                        JsonData json = JsonMapper.ToObject(content);
+                        if (!json.ContainsKey("functionName") || !json.ContainsKey("value"))
                         {
-                            if (ReceiveEvent != null)
-                            {
-                                ReceiveEvent.Invoke(packet);
-                            }
+                            continue;
+                        }
+
+                        string functionName = json["functionName"].ToString();
+                        if (ReceiveFunctionEvent != null)
+                        {
+                            ReceiveFunctionEvent.Invoke(functionName, json["value"].ToString());
                         }
                     }
-                    catch (Exception e)
+                    else if (ReceiveEvent != null)
                     {
-                        Debug.LogError("ReceivePacketHandle Exception:" + e.ToString());
+                        ReceiveEvent.Invoke(packet);
                     }
+                }
+                catch (Exception e)
+                {
+                    Debug.LogError("ReceivePacketHandle Exception:" + e);
                 }
             }
         }
@@ -421,9 +598,46 @@ namespace Robot
         public void Reconnect()
         {
             LogWindow.Info("Attempting to reconnect to TCP server");
-            Connect(_address);
+            Connect(_address, _localAddress);
         }
 
+
+        /// <summary>
+        /// Wake OnTrackingThread after a TCP cache seq advance. Sample threads call this;
+        /// wire protocol is unchanged.
+        /// </summary>
+        public static void NotifyTrackingSampleAvailable()
+        {
+            try
+            {
+                s_trackingSampleSignal.Set();
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+        }
+
+        private void WaitForTrackingSample(int timeoutMs)
+        {
+            int spinUs = Mathf.Max(0, trackingThreadWakeSpinUs);
+            if (spinUs > 0)
+            {
+                long spinTicks = Math.Max(1,
+                    (System.Diagnostics.Stopwatch.Frequency * spinUs) / 1000000L);
+                long spinUntil = System.Diagnostics.Stopwatch.GetTimestamp() + spinTicks;
+                while (System.Diagnostics.Stopwatch.GetTimestamp() < spinUntil)
+                {
+                    if (s_trackingSampleSignal.WaitOne(0))
+                    {
+                        return;
+                    }
+
+                    Thread.SpinWait(8);
+                }
+            }
+
+            s_trackingSampleSignal.WaitOne(Mathf.Max(1, GetClampedSleepMs(timeoutMs)));
+        }
 
         private void OnTrackingThread()
         {
@@ -433,13 +647,15 @@ namespace Robot
                 {
                     LogEnterpriseDirectTrackingGateIfChanged();
                     ResetDirectTrackingCache();
-                    Thread.Sleep(GetClampedSleepMs(trackingThreadIdleSleepMs));
+                    WaitForTrackingSample(trackingThreadIdleSleepMs);
                     continue;
                 }
 
+                // Backpressure: do not build another direct packet. Wait for send to drain
+                // (NotifyTrackingSampleAvailable after pending--), not Sleep-and-miss the beat.
                 if (_pendingDirectTrackingPackets >= 2)
                 {
-                    Thread.Sleep(GetClampedSleepMs(trackingThreadQueueBackpressureSleepMs));
+                    WaitForTrackingSample(trackingThreadQueueBackpressureSleepMs);
                     continue;
                 }
 
@@ -461,7 +677,11 @@ namespace Robot
                 long handSampleSeq = _lastDirectTrackingHandSampleSeq;
                 long bodySampleSeq = _lastDirectTrackingBodySampleSeq;
                 long motionSampleSeq = _lastDirectTrackingMotionSampleSeq;
-                bool hasNewTrackingSample = false;
+                bool headNew = false;
+                bool controllerNew = false;
+                bool handNew = false;
+                bool bodyNew = false;
+                bool motionNew = false;
 
                 LogEnterpriseDirectTrackingGateIfChanged();
                 if (TrackingData.HeadOn)
@@ -476,13 +696,13 @@ namespace Robot
                             !TrackingData.HandTrackingOn &&
                             TrackingData.TrackingTypeValue <= TrackingData.TrackingType.None)
                         {
-                            Thread.Sleep(GetClampedSleepMs(trackingThreadWaitForHeadSleepMs));
+                            WaitForTrackingSample(trackingThreadWaitForHeadSleepMs);
                             continue;
                         }
                     }
                     else
                     {
-                        hasNewTrackingSample |= headSampleSeq != _lastDirectTrackingHeadSampleSeq;
+                        headNew = headSampleSeq != _lastDirectTrackingHeadSampleSeq;
                     }
                 }
 
@@ -498,47 +718,110 @@ namespace Robot
                         rightController = EnterpriseCollectionRecorder.CreateInvalidEnterpriseControllerTcpPose();
                     }
 
-                    hasNewTrackingSample |= controllerSampleSeq != _lastDirectTrackingControllerSampleSeq;
+                    controllerNew = controllerSampleSeq != _lastDirectTrackingControllerSampleSeq;
                 }
 
                 if (TrackingData.HandTrackingOn &&
                     EnterpriseAuxTrackingSampler.TryGetLatestHandJson(out handJson, out handSampleSeq))
                 {
-                    hasNewTrackingSample |= handSampleSeq != _lastDirectTrackingHandSampleSeq;
+                    handNew = handSampleSeq != _lastDirectTrackingHandSampleSeq;
                 }
 
                 if (TrackingData.TrackingTypeValue == TrackingData.TrackingType.Body &&
                     EnterpriseAuxTrackingSampler.TryGetLatestBodyJson(out bodyJson, out bodySampleSeq))
                 {
-                    hasNewTrackingSample |= bodySampleSeq != _lastDirectTrackingBodySampleSeq;
+                    bodyNew = bodySampleSeq != _lastDirectTrackingBodySampleSeq;
                 }
 
                 if (TrackingData.TrackingTypeValue == TrackingData.TrackingType.Motion &&
                     EnterpriseAuxTrackingSampler.TryGetLatestMotionJson(out motionJson, out motionSampleSeq))
                 {
-                    hasNewTrackingSample |= motionSampleSeq != _lastDirectTrackingMotionSampleSeq;
+                    motionNew = motionSampleSeq != _lastDirectTrackingMotionSampleSeq;
                 }
 
+                bool hasNewTrackingSample = headNew || controllerNew || handNew || bodyNew || motionNew;
                 if (!hasNewTrackingSample)
                 {
                     Interlocked.Increment(ref _directStaleReadCount);
-                    // Avoid a tight busy loop even though no managed payload is created.
-                    Thread.Sleep(Mathf.Max(1, GetClampedSleepMs(trackingThreadQueueBackpressureSleepMs)));
+                    WaitForTrackingSample(trackingThreadSampleWaitTimeoutMs);
                     continue;
                 }
 
                 Interlocked.Increment(ref _directNewSampleCount);
 
-                JsonData trackingValue = new JsonData();
-                if (TrackingData.HeadOn && !string.IsNullOrEmpty(headPose))
+                if (!SendTrackingData)
                 {
-                    JsonData head = new JsonData();
-                    head["pose"] = headPose;
-                    head["status"] = headStatus;
-                    trackingValue["Head"] = head;
+                    WaitForTrackingSample(trackingThreadIdleSleepMs);
+                    continue;
                 }
 
-                if (TrackingData.ControllerOn)
+                // A packet already carries the latest sample of every enabled source, so
+                // emitting one per source event duplicates payloads. Trigger on the first
+                // enabled source that has data instead: that keeps packets 1:1 with the
+                // sampling period, and unlike a sleep-based rate limiter it does not
+                // overshoot (Android sleep granularity is several milliseconds).
+                bool headReady = headPose != null;
+                bool controllerReady = controllerSampleSeq != 0;
+                bool handReady = !string.IsNullOrEmpty(handJson);
+                bool bodyReady = !string.IsNullOrEmpty(bodyJson);
+                bool primaryNew;
+                if (TrackingData.HeadOn && headReady)
+                {
+                    primaryNew = headNew;
+                }
+                else if (TrackingData.ControllerOn && controllerReady)
+                {
+                    primaryNew = controllerNew;
+                }
+                else if (TrackingData.HandTrackingOn && handReady)
+                {
+                    primaryNew = handNew;
+                }
+                else if (bodyReady)
+                {
+                    primaryNew = bodyNew;
+                }
+                else
+                {
+                    primaryNew = motionNew;
+                }
+
+                if (!primaryNew)
+                {
+                    // Non-primary source advanced only: wait for primary (usually Head) event.
+                    WaitForTrackingSample(trackingThreadSampleWaitTimeoutMs);
+                    continue;
+                }
+
+                bool omitUnchanged = OmitUnchangedSourcesEnabled;
+                // Include source if official bundle, or B0 and seq advanced. Always emit
+                // timeStampNs so fa-py frame gate advances even when only Head changed.
+                bool includeHead = TrackingData.HeadOn && !string.IsNullOrEmpty(headPose) &&
+                                   (!omitUnchanged || headNew);
+                bool includeController = TrackingData.ControllerOn &&
+                                         (!omitUnchanged || controllerNew);
+                bool includeHand = TrackingData.HandTrackingOn &&
+                                   !string.IsNullOrEmpty(handJson) &&
+                                   (!omitUnchanged || handNew);
+                bool includeBody = TrackingData.TrackingTypeValue == TrackingData.TrackingType.Body &&
+                                   !string.IsNullOrEmpty(bodyJson) &&
+                                   (!omitUnchanged || bodyNew);
+                bool includeMotion = TrackingData.TrackingTypeValue == TrackingData.TrackingType.Motion &&
+                                     !string.IsNullOrEmpty(motionJson) &&
+                                     (!omitUnchanged || motionNew);
+
+                StringBuilder valueBuilder = new StringBuilder(1024);
+                bool hasField = false;
+                valueBuilder.Append('{');
+
+                if (includeHead)
+                {
+                    AppendJsonField(valueBuilder, ref hasField, "Head");
+                    valueBuilder.Append("{\"pose\":\"").Append(headPose)
+                        .Append("\",\"status\":").Append(headStatus).Append('}');
+                }
+
+                if (includeController)
                 {
                     GetControllerInputSnapshot(out ControllerInputState leftInput, out ControllerInputState rightInput);
                     if (!IsControllerActiveInput())
@@ -551,49 +834,71 @@ namespace Robot
                         rightController,
                         leftInput,
                         rightInput);
-                    trackingValue["Controller"] = controller;
+                    AppendJsonField(valueBuilder, ref hasField, "Controller");
+                    valueBuilder.Append(controller.ToJson());
                     LogEnterpriseControllerPayloadIfNeeded(controller, controllerSampleSeq);
                 }
 
-                // Latest-only attach: Hand/Body/Motion failures never skip Head/Controller.
-                if (TrackingData.HandTrackingOn && !string.IsNullOrEmpty(handJson))
+                // Hand/Body/Motion: pre-serialized JSON embedded as-is.
+                if (includeHand)
                 {
-                    trackingValue["Hand"] = JsonMapper.ToObject(handJson);
+                    AppendJsonField(valueBuilder, ref hasField, "Hand");
+                    valueBuilder.Append(handJson);
                 }
 
-                if (TrackingData.TrackingTypeValue == TrackingData.TrackingType.Body &&
-                    !string.IsNullOrEmpty(bodyJson))
+                if (includeBody)
                 {
-                    trackingValue["Body"] = JsonMapper.ToObject(bodyJson);
+                    AppendJsonField(valueBuilder, ref hasField, "Body");
+                    valueBuilder.Append(bodyJson);
                 }
 
-                if (TrackingData.TrackingTypeValue == TrackingData.TrackingType.Motion &&
-                    !string.IsNullOrEmpty(motionJson))
+                if (includeMotion)
                 {
-                    trackingValue["Motion"] = JsonMapper.ToObject(motionJson);
+                    AppendJsonField(valueBuilder, ref hasField, "Motion");
+                    valueBuilder.Append(motionJson);
                 }
 
-                JsonData appState = new JsonData();
-                trackingValue["timeStampNs"] = Utils.GetCurrentTimestamp();
-                appState["focus"] = _cachedAppFocus;
-                trackingValue["appState"] = appState;
-                trackingValue["Input"] = _cachedActiveInputDevice;
-
-                JsonData sendJson = new JsonData();
-                sendJson["functionName"] = "Tracking";
-                sendJson["value"] = trackingValue.ToJson();
+                AppendJsonField(valueBuilder, ref hasField, "timeStampNs");
+                valueBuilder.Append(Utils.GetCurrentTimestamp());
+                AppendJsonField(valueBuilder, ref hasField, "appState");
+                valueBuilder.Append(_cachedAppFocus ? "{\"focus\":true}" : "{\"focus\":false}");
+                AppendJsonField(valueBuilder, ref hasField, "Input");
+                valueBuilder.Append(_cachedActiveInputDevice);
+                valueBuilder.Append('}');
 
                 _sendDatas.Enqueue(new SendData(
                     NetCMD.PACKET_CCMD_TO_CONTROLLER_FUNCTION,
-                    Encoding.UTF8.GetBytes(sendJson.ToJson()),
+                    Encoding.UTF8.GetBytes(BuildTrackingFunctionPacket(valueBuilder)),
                     true));
+                s_sendSignal.Set();
                 Interlocked.Increment(ref _directEnqueueCount);
                 Interlocked.Increment(ref _pendingDirectTrackingPackets);
-                _lastDirectTrackingHeadSampleSeq = headSampleSeq;
-                _lastDirectTrackingControllerSampleSeq = controllerSampleSeq;
-                _lastDirectTrackingHandSampleSeq = handSampleSeq;
-                _lastDirectTrackingBodySampleSeq = bodySampleSeq;
-                _lastDirectTrackingMotionSampleSeq = motionSampleSeq;
+                // B0: only advance last-sent seq for sources actually carried; skipped
+                // sources stay "new" for a later packet (or until throttle allows).
+                if (!omitUnchanged || includeHead)
+                {
+                    _lastDirectTrackingHeadSampleSeq = headSampleSeq;
+                }
+
+                if (!omitUnchanged || includeController)
+                {
+                    _lastDirectTrackingControllerSampleSeq = controllerSampleSeq;
+                }
+
+                if (!omitUnchanged || includeHand)
+                {
+                    _lastDirectTrackingHandSampleSeq = handSampleSeq;
+                }
+
+                if (!omitUnchanged || includeBody)
+                {
+                    _lastDirectTrackingBodySampleSeq = bodySampleSeq;
+                }
+
+                if (!omitUnchanged || includeMotion)
+                {
+                    _lastDirectTrackingMotionSampleSeq = motionSampleSeq;
+                }
 
                 LogDirectTrackingStatsIfNeeded(headSampleSeq, controllerSampleSeq);
             }
@@ -608,6 +913,56 @@ namespace Robot
                     TrackingData.ControllerOn ||
                     TrackingData.HandTrackingOn ||
                     TrackingData.TrackingTypeValue > TrackingData.TrackingType.None);
+        }
+
+        private static void AppendJsonField(StringBuilder builder, ref bool hasField, string fieldName)
+        {
+            if (hasField)
+            {
+                builder.Append(',');
+            }
+
+            hasField = true;
+            builder.Append('"').Append(fieldName).Append("\":");
+        }
+
+        /// <summary>
+        /// Wraps an assembled value object into the Tracking packet. The value travels as a
+        /// JSON string, so it is escaped in one pass here instead of being written into a
+        /// JsonData tree and serialized twice per packet.
+        /// </summary>
+        private static string BuildTrackingFunctionPacket(StringBuilder valueBuilder)
+        {
+            StringBuilder packet = new StringBuilder(valueBuilder.Length + 64);
+            packet.Append("{\"functionName\":\"Tracking\",\"value\":\"");
+            for (int i = 0; i < valueBuilder.Length; i++)
+            {
+                char c = valueBuilder[i];
+                switch (c)
+                {
+                    case '"':
+                        packet.Append("\\\"");
+                        break;
+                    case '\\':
+                        packet.Append("\\\\");
+                        break;
+                    case '\n':
+                        packet.Append("\\n");
+                        break;
+                    case '\r':
+                        packet.Append("\\r");
+                        break;
+                    case '\t':
+                        packet.Append("\\t");
+                        break;
+                    default:
+                        packet.Append(c);
+                        break;
+                }
+            }
+
+            packet.Append("\"}");
+            return packet.ToString();
         }
 
         private static JsonData BuildEnterpriseControllerJson(
@@ -791,6 +1146,8 @@ namespace Robot
 
         private void RecordTrackingPacketSent(string mode)
         {
+            // Panel "FPS" is the tracking packet rate, so both send paths must feed it.
+            FPSDisplay.UpdateTime();
             _trackingPacketsSentInWindow++;
             _lastTrackingSendMode = mode;
             LogTrackingRateIfNeeded();
@@ -806,8 +1163,14 @@ namespace Robot
             }
 
             double sendHz = elapsedSeconds > 0 ? _trackingPacketsSentInWindow / elapsedSeconds : 0;
+            double kibPerSecond = elapsedSeconds > 0
+                ? Interlocked.Exchange(ref _trackingBytesSentInWindow, 0) / 1024.0 / elapsedSeconds
+                : 0;
+            UpdateAutoThrottle(kibPerSecond, _pendingDirectTrackingPackets);
             string rateMessage =
-                $"TCP tracking send rate: {sendHz:F1}Hz mode={_lastTrackingSendMode} pending={_pendingDirectTrackingPackets}";
+                $"TCP tracking send rate: {sendHz:F1}Hz {kibPerSecond:F1}KiB/s mode={_lastTrackingSendMode} " +
+                $"pending={_pendingDirectTrackingPackets} omitUnchanged={OmitUnchangedSourcesEnabled} " +
+                $"auxThrottleHz={SharedAuxThrottleHz}";
             if (outputTrackingRateToLogWindow)
             {
                 LogWindow.Info(rateMessage);
@@ -816,6 +1179,40 @@ namespace Robot
             Debug.Log($"{Tag}{rateMessage}");
             _trackingPacketsSentInWindow = 0;
             _trackingRateStopwatch.Restart();
+        }
+
+        private void UpdateAutoThrottle(double kibPerSecond, int pending)
+        {
+            if (Volatile.Read(ref s_autoThrottleEnabled) == 0)
+            {
+                return;
+            }
+
+            int maxHz = Mathf.Clamp(auxThrottleMaxHz, 1, 1000);
+            int minHz = Mathf.Clamp(auxThrottleMinHz, 1, maxHz);
+            int step = Mathf.Max(1, auxThrottleStepHz);
+            int cur = Volatile.Read(ref s_auxThrottleHz);
+            cur = Mathf.Clamp(cur, minHz, maxHz);
+
+            bool overBudget = kibPerSecond > bandwidthBudgetKiBps || pending >= 2;
+            bool underBudget = kibPerSecond < (bandwidthBudgetKiBps - Mathf.Max(0f, bandwidthRecoverMarginKiBps)) &&
+                               pending <= 0;
+            int next = cur;
+            if (overBudget && cur > minHz)
+            {
+                next = Math.Max(minHz, cur - step);
+            }
+            else if (underBudget && cur < maxHz)
+            {
+                next = Math.Min(maxHz, cur + step);
+            }
+
+            if (next != cur)
+            {
+                Volatile.Write(ref s_auxThrottleHz, next);
+                Debug.Log($"{Tag}auto-throttle auxHz {cur} -> {next} " +
+                          $"(kib/s={kibPerSecond:F1} budget={bandwidthBudgetKiBps:F0} pending={pending})");
+            }
         }
 
         private void LogDirectTrackingStatsIfNeeded(long headSeq, long controllerSeq)
@@ -855,7 +1252,37 @@ namespace Robot
         {
             while (_state != SocketState.DESTROY)
             {
-                if (_state != SocketState.WORKING)
+                Socket socket;
+                int generation;
+                bool closeStaleWorkingSocket;
+                lock (_sendObject)
+                {
+                    if (_state == SocketState.DESTROY)
+                    {
+                        return;
+                    }
+
+                    closeStaleWorkingSocket = _state == SocketState.WORKING &&
+                                              (_socket == null || !_socket.Connected);
+                    if (_state != SocketState.WORKING || _socket == null || !_socket.Connected)
+                    {
+                        socket = null;
+                        generation = _connectionGeneration;
+                    }
+                    else
+                    {
+                        socket = _socket;
+                        generation = _connectionGeneration;
+                    }
+                }
+
+                if (closeStaleWorkingSocket)
+                {
+                    CloseIfCurrent(generation);
+                    continue;
+                }
+
+                if (socket == null)
                 {
                     Thread.Sleep(100);
                     continue;
@@ -863,117 +1290,114 @@ namespace Robot
 
                 try
                 {
-                    lock (_sendObject)
+                    bool sentQueuedPacket = false;
+                    while (_sendDatas.TryDequeue(out SendData sendData))
                     {
-                        SocketError socketError = SocketError.Success;
-                        if (_socket != null && _socket.Connected)
+                        sentQueuedPacket = true;
+                        // A close/reconnect resets the counter while packets can still be
+                        // queued, so heal it instead of trusting it to stay non-negative.
+                        if (sendData.IsDirectTracking &&
+                            Interlocked.Decrement(ref _pendingDirectTrackingPackets) < 0)
                         {
-                            //Sending general messages (Head/Controller direct first)
-                            while (_sendDatas.TryDequeue(out SendData sendData))
+                            Interlocked.Exchange(ref _pendingDirectTrackingPackets, 0);
+                        }
+
+                        if (sendData.IsDirectTracking)
+                        {
+                            // Unblock tracking thread waiting on pending>=2.
+                            NotifyTrackingSampleAvailable();
+                        }
+
+                        byte[] data = PackageHandle.Pack(sendData.Cmd, sendData.Content);
+                        if (!TrySendAll(socket, data, out SocketError socketError))
+                        {
+                            LogWindow.Error($"TCP send error: {socketError}");
+                            Debug.LogError(Tag + "send SocketError:" + socketError);
+                            CloseIfCurrent(generation);
+                            break;
+                        }
+
+                        if (sendData.Cmd == NetCMD.PACKET_CCMD_SEND_VERSION)
+                        {
+                            LogWindow.Info("PC connection established - version packet sent successfully");
+                            Debug.Log("pc connected !");
+                            _connectInited = true;
+                        }
+
+                        if (sendData.IsDirectTracking)
+                        {
+                            Interlocked.Add(ref _trackingBytesSentInWindow, data.Length);
+                            RecordTrackingPacketSent("enterprise_direct");
+                        }
+                    }
+
+                    if (sentQueuedPacket)
+                    {
+                        continue;
+                    }
+
+                    if (_connectInited && SendTrackingData && !ShouldSendEnterpriseTrackingDirectly())
+                    {
+                        if (_sendTrackingMsg.TryDequeue(out var msg))
+                        {
+                            _sendJson["functionName"] = "Tracking";
+                            _sendJson["value"] = msg;
+                            byte[] data = PackageHandle.Pack(NetCMD.PACKET_CCMD_TO_CONTROLLER_FUNCTION,
+                                Encoding.UTF8.GetBytes(_sendJson.ToJson()));
+                            int res = socket.Send(data, 0, data.Length, SocketFlags.None, out SocketError socketError);
+                            if (res < data.Length)
                             {
-                                if (sendData.IsDirectTracking)
-                                {
-                                    Interlocked.Decrement(ref _pendingDirectTrackingPackets);
-                                }
-
-                                byte[] data = PackageHandle.Pack(sendData.Cmd, sendData.Content);
-
-                                int totalBytes = data.Length;
-                                int bytesSent = 0;
-                                while (bytesSent < totalBytes)
-                                {
-                                    int remainingBytes = totalBytes - bytesSent;
-                                    bytesSent += _socket.Send(data, bytesSent, remainingBytes,
-                                        SocketFlags.None,
-                                        out socketError);
-                                    if (socketError == SocketError.Success)
-                                    {
-                                        if (sendData.Cmd == NetCMD.PACKET_CCMD_SEND_VERSION)
-                                        {
-                                            //This message has been successfully sent, indicating the establishment of communication with the PC side
-                                            LogWindow.Info("PC connection established - version packet sent successfully");
-                                            Debug.Log("pc connected !");
-                                            _connectInited = true;
-                                        }
-                                    }
-                                    else
-                                    {
-                                        break;
-                                    }
-                                }
-
-                                if (socketError != SocketError.Success)
-                                {
-                                    LogWindow.Error($"TCP send error: {socketError}");
-                                    Debug.LogError(Tag + "send SocketError:" + socketError);
-                                    Close();
-                                    break;
-                                }
-
-                                if (sendData.IsDirectTracking)
-                                {
-                                    RecordTrackingPacketSent("enterprise_direct");
-                                }
+                                Debug.LogWarning(Tag + "Incomplete data occurrence!");
                             }
 
-                            //Tracking data transmission
-                            if (_connectInited && SendTrackingData && !ShouldSendEnterpriseTrackingDirectly())
+                            if (socketError != SocketError.Success)
                             {
-                                if (_sendTrackingMsg.Count > 0)
-                                {
-                                    _sendTrackingMsg.TryDequeue(out var msg);
-                                    //Display the frequency of tracking data occurrence
-                                    FPSDisplay.UpdateTime();
-                                    _sendJson["functionName"] = "Tracking";
-                                    _sendJson["value"] = msg;
-
-                                    byte[] data = PackageHandle.Pack(NetCMD.PACKET_CCMD_TO_CONTROLLER_FUNCTION,
-                                        Encoding.UTF8.GetBytes(_sendJson.ToJson()));
-
-                                    int res = _socket.Send(data, 0, data.Length, SocketFlags.None,
-                                        out socketError);
-                                    if (res < data.Length)
-                                    {
-                                        Debug.LogWarning(Tag + "Incomplete data occurrence!");
-                                    }
-
-
-                                    if (socketError != SocketError.Success)
-                                    {
-                                        LogWindow.Error($"TCP tracking data send error: {socketError}");
-                                        Debug.LogError(Tag + "SocketError:" + socketError);
-                                        Close();
-                                        continue;
-                                    }
-
-                                    RecordTrackingPacketSent("legacy");
-                                }
+                                LogWindow.Error($"TCP tracking data send error: {socketError}");
+                                Debug.LogError(Tag + "SocketError:" + socketError);
+                                CloseIfCurrent(generation);
+                                continue;
                             }
-                            else
-                            {
-                                if (ShouldSendEnterpriseTrackingDirectly())
-                                {
-                                    Thread.Yield();
-                                }
-                                else
-                                {
-                                    Thread.Sleep(14);
-                                }
-                            }
+
+                            Interlocked.Add(ref _trackingBytesSentInWindow, data.Length);
+                            RecordTrackingPacketSent("legacy");
                         }
                         else
                         {
-                            Close();
+                            s_sendSignal.WaitOne(1);
                         }
+                    }
+                    else
+                    {
+                        // Wait for the next queued packet instead of spinning. Direct tracking
+                        // sets the signal on every enqueue, so this costs no extra latency.
+                        s_sendSignal.WaitOne(14);
                     }
                 }
                 catch (Exception e)
                 {
                     LogWindow.Error($"TCP send thread error: {e.Message}");
                     Debug.LogError(Tag + "Error OnSendThread:" + e);
-                    Close();
+                    CloseIfCurrent(generation);
                 }
             }
+        }
+
+        private static bool TrySendAll(Socket socket, byte[] data, out SocketError socketError)
+        {
+            int totalBytes = data.Length;
+            int bytesSent = 0;
+            socketError = SocketError.Success;
+            while (bytesSent < totalBytes)
+            {
+                int remainingBytes = totalBytes - bytesSent;
+                bytesSent += socket.Send(data, bytesSent, remainingBytes, SocketFlags.None, out socketError);
+                if (socketError != SocketError.Success)
+                {
+                    return false;
+                }
+            }
+
+            return true;
         }
 
         private void OnDestroy()
@@ -983,43 +1407,107 @@ namespace Robot
                 Close();
             }
 
-            _state = SocketState.DESTROY;
+            lock (_sendObject)
+            {
+                _state = SocketState.DESTROY;
+            }
+
+            NotifyTrackingSampleAvailable();
+            try
+            {
+                s_sendSignal.Set();
+            }
+            catch (ObjectDisposedException)
+            {
+            }
         }
 
         public void Close()
         {
             LogWindow.Info("Closing TCP connection");
             Debug.Log(Tag + "Close:");
-            if (_receivePackages != null)
+            ClearReceiveQueue();
+            Socket socket;
+            lock (_sendObject)
             {
-                lock (_receivePackages)
-                {
-                    _receivePackages.Clear();
-                }
+                _connectionGeneration++;
+                _state = SocketState.CLOSE;
+                _connectInited = false;
+                socket = _socket;
+                _socket = null;
             }
 
-            _state = SocketState.CLOSE;
             ResetDirectTrackingCache();
             EnterpriseAuxTrackingSampler.ClearCaches();
             Interlocked.Exchange(ref _pendingDirectTrackingPackets, 0);
+            NotifyTrackingSampleAvailable();
+            DisposeSocket(socket);
+        }
+
+        private void CloseIfCurrent(int generation)
+        {
+            Socket socket;
             lock (_sendObject)
             {
-                if (_socket != null)
+                if (_connectionGeneration != generation)
                 {
-                    try
-                    {
-                        if (_socket.Connected)
-                        {
-                            _socket.Shutdown(SocketShutdown.Both);
-                            _socket.Close();
-                        }
-                    }
-                    catch (Exception e)
-                    {
-                        LogWindow.Error($"TCP socket cleanup error: {e.Message}");
-                        Debug.LogError(Tag + "Clear Error:" + e);
-                    }
+                    return;
                 }
+
+                _connectionGeneration++;
+                _state = SocketState.CLOSE;
+                _connectInited = false;
+                socket = _socket;
+                _socket = null;
+            }
+
+            LogWindow.Info("Closing TCP connection");
+            Debug.Log(Tag + "Close:");
+            ClearReceiveQueue();
+            ResetDirectTrackingCache();
+            EnterpriseAuxTrackingSampler.ClearCaches();
+            Interlocked.Exchange(ref _pendingDirectTrackingPackets, 0);
+            NotifyTrackingSampleAvailable();
+            DisposeSocket(socket);
+        }
+
+        private void ClearReceiveQueue()
+        {
+            while (_receivePackages.TryDequeue(out _))
+            {
+            }
+        }
+
+        private bool IsCurrentAttempt(IoAttempt attempt)
+        {
+            lock (_sendObject)
+            {
+                return IsCurrentAttemptLocked(attempt);
+            }
+        }
+
+        private bool IsCurrentAttemptLocked(IoAttempt attempt)
+        {
+            return attempt != null &&
+                   attempt.Generation == _connectionGeneration &&
+                   ReferenceEquals(_socket, attempt.Socket);
+        }
+
+        private static void DisposeSocket(Socket socket)
+        {
+            if (socket == null)
+            {
+                return;
+            }
+
+            try
+            {
+                socket.Close();
+            }
+            catch (Exception e)
+            {
+                LogWindow.Error($"TCP socket cleanup error: {e.Message}");
+                Debug.LogError(Tag + "Clear Error:" + e);
             }
         }
 
@@ -1035,6 +1523,18 @@ namespace Robot
                 Cmd = cmd;
                 Content = content;
                 IsDirectTracking = isDirectTracking;
+            }
+        }
+
+        private sealed class IoAttempt
+        {
+            public readonly int Generation;
+            public readonly Socket Socket;
+
+            public IoAttempt(int generation, Socket socket)
+            {
+                Generation = generation;
+                Socket = socket;
             }
         }
     }

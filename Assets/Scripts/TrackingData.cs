@@ -11,10 +11,15 @@ namespace Robot
 {
     public class TrackingData
     {
-        public static bool HeadOn { get; private set; }
-        public static bool ControllerOn { get; private set; }
-        public static bool HandTrackingOn { get; private set; }
-        public static TrackingType TrackingTypeValue { get; private set; }
+        private static volatile bool s_headOn;
+        private static volatile bool s_controllerOn;
+        private static volatile bool s_handTrackingOn;
+        private static volatile TrackingType s_trackingTypeValue;
+
+        public static bool HeadOn => s_headOn;
+        public static bool ControllerOn => s_controllerOn;
+        public static bool HandTrackingOn => s_handTrackingOn;
+        public static TrackingType TrackingTypeValue => s_trackingTypeValue;
 
         private JsonData _motionTrackingJson = new JsonData();
         private JsonData _bodyTrackingJson = new JsonData();
@@ -29,22 +34,22 @@ namespace Robot
 
         public static void SetHeadOn(bool on)
         {
-            HeadOn = on;
+            s_headOn = on;
         }
 
         public static void SetControllerOn(bool on)
         {
-            ControllerOn = on;
+            s_controllerOn = on;
         }
 
         public static void SetHandTrackingOn(bool on)
         {
-            HandTrackingOn = on;
+            s_handTrackingOn = on;
         }
 
         public static void SetTrackingType(TrackingType trackingType)
         {
-            TrackingTypeValue = trackingType;
+            s_trackingTypeValue = trackingType;
         }
 
         public static bool HasTracking
@@ -114,30 +119,22 @@ namespace Robot
                     totalData.Remove("Hand");
             }
 
-            if (TrackingTypeValue == TrackingType.Body)
+            if (TrackingTypeValue == TrackingType.Body && TryBuildBodyJson(out JsonData bodyJson))
             {
-                if (TryBuildBodyJson(out JsonData bodyJson))
-                {
-                    totalData["Body"] = bodyJson;
-                }
+                totalData["Body"] = bodyJson;
             }
-            else
+            else if (totalData.ContainsKey("Body"))
             {
-                if (totalData.ContainsKey("Body"))
-                    totalData.Remove("Body");
+                totalData.Remove("Body");
             }
 
-            if (TrackingTypeValue == TrackingType.Motion)
+            if (TrackingTypeValue == TrackingType.Motion && TryBuildMotionJson(out JsonData motionJson))
             {
-                if (TryBuildMotionJson(out JsonData motionJson))
-                {
-                    totalData["Motion"] = motionJson;
-                }
+                totalData["Motion"] = motionJson;
             }
-            else
+            else if (totalData.ContainsKey("Motion"))
             {
-                if (totalData.ContainsKey("Motion"))
-                    totalData.Remove("Motion");
+                totalData.Remove("Motion");
             }
 
 
@@ -213,11 +210,6 @@ namespace Robot
                 return false;
             }
 
-            if (PXR_MotionTracking.GetMotionTrackerMode() != MotionTrackerMode.BodyTracking)
-            {
-                return false;
-            }
-
             BodyTrackingGetDataInfo dataInfo = new BodyTrackingGetDataInfo();
             BodyTrackingData trackingData = new BodyTrackingData();
             int ret = PXR_MotionTracking.GetBodyTrackingData(ref dataInfo, ref trackingData);
@@ -232,12 +224,6 @@ namespace Robot
 
         public bool TryBuildMotionJson(out JsonData motionJson)
         {
-            motionJson = null;
-            if (PXR_MotionTracking.GetMotionTrackerMode() != MotionTrackerMode.MotionTracking)
-            {
-                return false;
-            }
-
             motionJson = FillMotionTrackingJson();
             return motionJson != null && motionJson.ContainsKey("len") && (int)motionJson["len"] > 0;
         }

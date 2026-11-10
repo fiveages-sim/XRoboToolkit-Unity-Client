@@ -66,9 +66,10 @@ public class CameraRequestDialog : MonoBehaviour
         SetResolutionData(resolutionInfo);
         int.TryParse(_cameraJsonList[index]["fps"].ToString(), out var fps);
         int bitrate = 1024 * 1024 * 10;
-        if (_cameraJsonList[index].ContainsKey("bitrate"))
+        if (_cameraJsonList[index].ContainsKey("bitrate") &&
+            !int.TryParse(_cameraJsonList[index]["bitrate"].ToString(), out bitrate))
         {
-            bitrate = int.Parse(_cameraJsonList[index]["bitrate"].ToString());
+            bitrate = 1024 * 1024 * 10;
         }
 
         SetDefaultValue(fps, bitrate);
@@ -117,23 +118,43 @@ public class CameraRequestDialog : MonoBehaviour
 
     public void OnConfirm()
     {
-        gameObject.SetActive(false);
-        if (_confirm != null)
+        if (_confirm == null || _resolutions == null ||
+            resolutionDropdown.value < 0 || resolutionDropdown.value >= _resolutions.Length)
         {
-            if (resolutionDropdown.value >= 0 && resolutionDropdown.value < _resolutions.Length)
-            {
-                string[] resolutionArr = _resolutions[resolutionDropdown.value].Split("x");
-
-                if (resolutionArr.Length > 1)
-                {
-                    ResolutionWidth = int.Parse(resolutionArr[0]);
-                    ResolutionHeight = int.Parse(resolutionArr[1]);
-                    Fps = int.Parse(fpsInputField.text);
-                    Bitrate = int.Parse(bitrateInputField.text);
-                    _confirm.Invoke();
-                }
-            }
+            Toast.Show("Invalid camera request");
+            return;
         }
+
+        string[] resolutionArr = _resolutions[resolutionDropdown.value].Split('x');
+        if (resolutionArr.Length < 2 ||
+            !TryParseClamped(resolutionArr[0], 16, 8192, out int width) ||
+            !TryParseClamped(resolutionArr[1], 16, 8192, out int height) ||
+            !TryParseClamped(fpsInputField != null ? fpsInputField.text : null, 1, 120, out int fps) ||
+            !TryParseClamped(bitrateInputField != null ? bitrateInputField.text : null, 1, 200 * 1024 * 1024,
+                out int bitrate))
+        {
+            Toast.Show("Invalid camera request parameters");
+            return;
+        }
+
+        gameObject.SetActive(false);
+        ResolutionWidth = width;
+        ResolutionHeight = height;
+        Fps = fps;
+        Bitrate = bitrate;
+        _confirm.Invoke();
+    }
+
+    private static bool TryParseClamped(string text, int minInclusive, int maxInclusive, out int value)
+    {
+        value = 0;
+        if (string.IsNullOrWhiteSpace(text) || !int.TryParse(text.Trim(), out value))
+        {
+            return false;
+        }
+
+        value = Mathf.Clamp(value, minInclusive, maxInclusive);
+        return true;
     }
 
     public void OnCancel()

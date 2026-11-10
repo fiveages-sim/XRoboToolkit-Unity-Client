@@ -30,7 +30,8 @@ public class Main : MonoBehaviour
 
     private void OnLogMessageReceived(string condition, string stackTrace, LogType type)
     {
-        LogView.Push(condition, stackTrace, type);
+        // LogView is optional UI; Push no-ops when no instance is mounted.
+        // Errors still go through Toast (thread-safe queue).
         if (type == LogType.Error)
         {
             Toast.Show(condition);

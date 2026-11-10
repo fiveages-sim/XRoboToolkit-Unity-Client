@@ -11,26 +11,35 @@ public class EnterpriseSampleRateUI : MonoBehaviour
     [Min(0)]
     public int Step = 50;
 
+    private EnterpriseCollectionRecorder _recorder;
+    private Text _increaseLabel;
+    private Text _decreaseLabel;
+    private int _lastDisplayedHz = int.MinValue;
+    private int _lastStep = int.MinValue;
+
     private void Awake()
     {
         if (IncreaseButton != null)
         {
             IncreaseButton.OnChange += OnIncreaseButton;
+            _increaseLabel = IncreaseButton.GetComponentInChildren<Text>(true);
         }
 
         if (DecreaseButton != null)
         {
             DecreaseButton.OnChange += OnDecreaseButton;
+            _decreaseLabel = DecreaseButton.GetComponentInChildren<Text>(true);
         }
 
-        RefreshButtonText();
-        RefreshText();
+        _recorder = FindObjectOfType<EnterpriseCollectionRecorder>();
+        RefreshButtonText(force: true);
+        RefreshText(force: true);
     }
 
     private void OnValidate()
     {
         Step = Mathf.Max(0, Step);
-        RefreshButtonText();
+        RefreshButtonText(force: true);
     }
 
     private void OnDestroy()
@@ -48,8 +57,13 @@ public class EnterpriseSampleRateUI : MonoBehaviour
 
     private void Update()
     {
-        RefreshButtonText();
-        RefreshText();
+        if (_recorder == null)
+        {
+            _recorder = FindObjectOfType<EnterpriseCollectionRecorder>();
+        }
+
+        RefreshButtonText(force: false);
+        RefreshText(force: false);
     }
 
     public void IncreaseSampleHz()
@@ -74,47 +88,59 @@ public class EnterpriseSampleRateUI : MonoBehaviour
 
     public void RefreshText()
     {
+        RefreshText(force: true);
+    }
+
+    private void RefreshText(bool force)
+    {
         if (SampleHzText == null)
         {
             return;
         }
 
-        EnterpriseCollectionRecorder recorder = FindObjectOfType<EnterpriseCollectionRecorder>();
-        SampleHzText.text = recorder != null ? $"Hz: {recorder.EnterpriseSampleHz}" : "0";
-    }
-
-    private void RefreshButtonText()
-    {
-        SetChildText(IncreaseButton, "+" + Step);
-        SetChildText(DecreaseButton, "-" + Step);
-    }
-
-    private static void SetChildText(CustomButton button, string text)
-    {
-        if (button == null)
+        int hz = _recorder != null ? _recorder.EnterpriseSampleHz : 0;
+        if (!force && hz == _lastDisplayedHz)
         {
             return;
         }
 
-        Text childText = button.GetComponentInChildren<Text>(true);
-        if (childText == null)
+        _lastDisplayedHz = hz;
+        SampleHzText.text = _recorder != null ? "Hz: " + hz : "0";
+    }
+
+    private void RefreshButtonText(bool force)
+    {
+        if (!force && Step == _lastStep)
         {
             return;
         }
 
-        childText.text = text;
+        _lastStep = Step;
+        if (_increaseLabel != null)
+        {
+            _increaseLabel.text = "+" + Step;
+        }
+
+        if (_decreaseLabel != null)
+        {
+            _decreaseLabel.text = "-" + Step;
+        }
     }
 
     private void AdjustSampleHz(int delta)
     {
-        EnterpriseCollectionRecorder recorder = FindObjectOfType<EnterpriseCollectionRecorder>();
-        if (recorder == null)
+        if (_recorder == null)
         {
-            RefreshText();
+            _recorder = FindObjectOfType<EnterpriseCollectionRecorder>();
+        }
+
+        if (_recorder == null)
+        {
+            RefreshText(force: true);
             return;
         }
 
-        recorder.AdjustEnterpriseSampleHz(delta);
-        RefreshText();
+        _recorder.AdjustEnterpriseSampleHz(delta);
+        RefreshText(force: true);
     }
 }

@@ -38,25 +38,25 @@ PICO Unity官方SDK，官方下载地址：https://developer.picoxr.com/zh/resou
 
 ## 工程配置
 ### 环境配置
-- Unity 2022.3.16f1+
-- Android Studio 4.2.2
-- Android SDK 29
-- Android NDK 21.4.7075529
-- PICO Unity SDK 1.1.0（推荐）
-（安装Unity 2022.3.16f1过程中，勾选Android配置下载，Unity即可自行完成环境构建）
+- Unity 2022.3.26f1c1（见 `ProjectVersion.txt`）
+- Android Studio 4.2.2+
+- Android minSdk 30 / targetSdk 31
+- Android NDK 21.4.7075529（或 Unity Android 模块自带 NDK）
+- PICO Unity SDK **3.4.0**（仓库内 `PICO Unity Integration SDK/`）
+（安装 Unity 时勾选 Android 模块，可一并完成 SDK/NDK 环境）
 
 ### 注意事项 
-- 请优先使用Unity 2022.3.16f1版本，其他版本可能会出现问题。
-- 请确保Android Studio和Android SDK的路径配置正确。
-- 请确保PICO Unity SDK的版本与Unity版本兼容。
-- 请确保PICO Unity SDK的路径配置正确。
+- 请优先使用 Unity 2022.3.26f1c1，与本仓库工程版本一致。
+- 请确保 Android Studio 和 Android SDK 的路径配置正确。
+- 请确保 PICO Unity SDK 为 3.4.0，并与头显固件兼容。
+- 请确保 PICO Unity SDK 路径 / Package Manager 引用正确。
 
 ### Unity打包导出APK步骤
-- 请确保Unity的版本为2022.3.16f1。
-- 请确保Unity的导出设置为Android平台。
-- 请确保ProjectKey和KeyAlias的配置正确，首次打包请通过Keystore Manager -> Create New。
-- 通过File -> Build Settings中的Build按钮进行导出。(Mac)
-- 导出的APK文件将保存在ProjectSettings目录下的Android文件夹中。
+- 请确保 Unity 版本为 2022.3.26f1c1。
+- 请确保导出平台为 Android。
+- 请确保 ProjectKey 和 KeyAlias 配置正确，首次打包请通过 Keystore Manager -> Create New。
+- 通过 File -> Build Settings 中的 Build 按钮导出。(Mac)
+- 导出的 APK 文件将保存在 ProjectSettings 目录下的 Android 文件夹中。
 
 ## 一键打包
 - 请确保环境配置正确。

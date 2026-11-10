@@ -106,6 +106,14 @@ public class UdpReceiver : MonoBehaviour
 
                 break;
             }
+            catch (Exception ex)
+            {
+                // Keep the receive loop alive on malformed packets / unpack bugs.
+                if (_isListening)
+                {
+                    Debug.LogError("UdpReceiver packet error: " + ex.Message);
+                }
+            }
         }
     }
 

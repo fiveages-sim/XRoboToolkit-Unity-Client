@@ -1,5 +1,7 @@
 package com.xrobotoolkit.enterprise;
 
+import android.os.Handler;
+import android.os.Looper;
 import android.util.Log;
 
 import com.picovr.robotassistantlib.CameraHandle;
@@ -8,8 +10,6 @@ import com.pxr.capturelib.PXRCameraCallBack;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -102,24 +102,59 @@ public final class CaptureOpener {
         }
     }
 
+    /**
+     * Best-effort only: reflects into CameraHandle private useState so a later
+     * CloseCamera does not StopPreview again. There is no public SDK API for this.
+     * Field/enum name fallbacks reduce breakage across AAR builds, but a PICO
+     * SDK upgrade can still make this return false silently — check logcat for
+     * "markUseStateIdle failed" after upgrading robotassistant / capturelib.
+     */
     public static boolean markUseStateIdle(CameraHandle cameraHandle) {
-        try {
-            if (cameraHandle == null) {
-                return false;
-            }
-
-            Class<?> useStateClass = Class.forName("com.picovr.robotassistantlib.CameraHandle$UseState");
-            Method valueOf = Enum.class.getMethod("valueOf", Class.class, String.class);
-            Object idle = valueOf.invoke(null, useStateClass, "IDLE");
-            Field useState = CameraHandle.class.getDeclaredField("useState");
-            useState.setAccessible(true);
-            useState.set(cameraHandle, idle);
-            Log.i(TAG, "useState set to IDLE so CloseCamera does not StopPreview again");
-            return true;
-        } catch (Throwable error) {
-            Log.e(TAG, "markUseStateIdle failed", error);
+        if (cameraHandle == null) {
             return false;
         }
+
+        String[] fieldNames = {"useState", "mUseState", "state"};
+        String[] idleNames = {"IDLE", "Idle", "NONE"};
+        for (String fieldName : fieldNames) {
+            try {
+                Field useState = CameraHandle.class.getDeclaredField(fieldName);
+                useState.setAccessible(true);
+                Object current = useState.get(cameraHandle);
+                if (current == null) {
+                    continue;
+                }
+
+                Class<?> useStateClass = current.getClass();
+                if (!useStateClass.isEnum()) {
+                    useStateClass = Class.forName("com.picovr.robotassistantlib.CameraHandle$UseState");
+                }
+
+                Object idle = null;
+                for (String idleName : idleNames) {
+                    try {
+                        Method valueOf = Enum.class.getMethod("valueOf", Class.class, String.class);
+                        idle = valueOf.invoke(null, useStateClass, idleName);
+                        break;
+                    } catch (Throwable ignored) {
+                    }
+                }
+                if (idle == null) {
+                    continue;
+                }
+
+                useState.set(cameraHandle, idle);
+                Log.i(TAG, "useState set to IDLE via field=" + fieldName
+                        + " so CloseCamera does not StopPreview again");
+                return true;
+            } catch (NoSuchFieldException ignored) {
+            } catch (Throwable error) {
+                Log.w(TAG, "markUseStateIdle try field=" + fieldName + " failed: " + error.getMessage());
+            }
+        }
+
+        Log.e(TAG, "markUseStateIdle failed: no compatible useState field/enum on this AAR");
+        return false;
     }
 
     /** 0=idle, 1=pending, 2=done. */
@@ -127,11 +162,13 @@ public final class CaptureOpener {
     private static volatile int finalizeStopResult = -1;
     private static volatile int finalizeCloseResult = -1;
     private static volatile int finalizeMarkIdleOk = 0;
-    private static ExecutorService finalizeExecutor;
+    private static Handler mainHandler;
 
     /**
-     * Vision stop (non-blocking for Unity): kick StopPreview+CloseCamera on a worker thread.
-     * Poll with {@link #pollFinalizeCapture()} then {@link #takeFinalizeCaptureResults()}.
+     * Vision stop: StopPreview+CloseCamera on the main looper.
+     * StartRecord runs on the Unity main thread; MediaCodec/GL stop must use that same thread.
+     * A background worker left 0-byte MP4s (stopPreviewResult=0) and GL_INVALID_OPERATION.
+     * Unity polls {@link #pollFinalizeCapture()} so the C# coroutine can yield.
      *
      * @return 0 accepted, -1 already running, -2 null handle
      */
@@ -145,26 +182,24 @@ public final class CaptureOpener {
         finalizePoll.set(1);
         finalizeStopResult = -1;
         finalizeCloseResult = -1;
-        boolean idleOk = markUseStateIdle(cameraHandle);
-        finalizeMarkIdleOk = idleOk ? 1 : 0;
-        if (finalizeExecutor == null) {
-            finalizeExecutor = Executors.newSingleThreadExecutor(r -> {
-                Thread t = new Thread(r, "VisionCaptureFinalize");
-                t.setDaemon(true);
-                return t;
-            });
+        finalizeMarkIdleOk = 0;
+        if (mainHandler == null) {
+            mainHandler = new Handler(Looper.getMainLooper());
         }
         final CameraHandle handle = cameraHandle;
-        finalizeExecutor.execute(() -> {
+        mainHandler.post(() -> {
             int stopResult = -1;
             int closeResult = -1;
             try {
+                // StopPreview must run while useState is still RECORDING so the muxer writes moov.
                 stopResult = handle.StopPreview();
                 Log.i(TAG, "async finalize StopPreview result=" + stopResult);
             } catch (Throwable error) {
                 Log.e(TAG, "async finalize StopPreview failed", error);
                 stopResult = -3;
             }
+            boolean idleOk = markUseStateIdle(handle);
+            finalizeMarkIdleOk = idleOk ? 1 : 0;
             try {
                 closeResult = handle.CloseCamera();
                 Log.i(TAG, "async finalize CloseCamera result=" + closeResult);

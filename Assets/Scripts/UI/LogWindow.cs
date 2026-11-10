@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Threading;
 using System.Collections;
 using TMPro;
@@ -7,9 +8,14 @@ using UnityEngine.UI;
 
 public class LogWindow : MonoBehaviour
 {
+    private const int MaxLines = 200;
+
     public TextMeshProUGUI text;
 
     public ScrollRect scrollRect;
+
+    private readonly Queue<string> _lines = new Queue<string>();
+    private bool _scrollPending;
 
     private static LogWindow _instance;
     private static readonly ConcurrentQueue<string> PendingMessages = new ConcurrentQueue<string>();
@@ -38,6 +44,7 @@ public class LogWindow : MonoBehaviour
         UpdateRectTransformHeight();
 
         scrollRect.verticalNormalizedPosition = 0f;
+        _scrollPending = false;
     }
 
     private void UpdateRectTransformHeight()
@@ -75,9 +82,21 @@ public class LogWindow : MonoBehaviour
         {
             // add time prefix of local timezone to the message
             string timePrefix = $"[{System.DateTime.Now:HH:mm:ss}] ";
-            _instance.text.text += $"{timePrefix}{message}\n";
+            _instance._lines.Enqueue($"{timePrefix}{message}");
+            while (_instance._lines.Count > MaxLines)
+            {
+                _instance._lines.Dequeue();
+            }
 
-            StartCoroutine(AutoScrollCoroutine());
+            // Keep the text bounded: appending with += copies the whole buffer and a long
+            // session otherwise ends up rebuilding an ever growing text mesh per line.
+            _instance.text.text = string.Join("\n", _instance._lines);
+
+            if (!_instance._scrollPending)
+            {
+                _instance._scrollPending = true;
+                StartCoroutine(AutoScrollCoroutine());
+            }
         }
     }
 

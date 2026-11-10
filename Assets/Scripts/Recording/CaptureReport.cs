@@ -9,7 +9,7 @@ using UnityEngine;
 namespace Robot
 {
     /// <summary>
-    /// Facts written into recording_meta. Does not open a camera and does not change file names.
+    /// Facts written into session meta.json capture={...}. Does not open a camera.
     /// </summary>
     public static class CaptureReport
     {
@@ -39,121 +39,6 @@ namespace Robot
             meta["calibration"] = CalibrationNote(width, height, false);
             meta["timeSync"] = Mp4TimeSync();
             meta["configuredFps"] = fps;
-        }
-
-        public static void WriteApiMp4Plan(JsonData meta, int width, int height, int fps, string cameraMode)
-        {
-            // Legacy api-mp4 plan; exp_Image=1 now uses WriteApiFramesPlan.
-            WriteApiFramesPlan(meta, width, height, fps, cameraMode, "", "", 80);
-        }
-
-        public static void WriteApiFramesPlan(JsonData meta, int width, int height, int fps, string cameraMode,
-            string framesDir, string framesJsonlPath, int jpegQuality)
-        {
-            JsonData modes = new JsonData();
-            modes["selected"] = cameraMode ?? "LEFT";
-            modes["available"] = "LEFT, RIGHT, 3D, Interlace";
-            modes["note"] =
-                "Only the selected mode is started with StartGetImageDatafor4U. Other modes are listed from PXRCaptureRenderMode.";
-            meta["cameraModes"] = modes;
-            meta["configuredFps"] = fps;
-            meta["picoApiFrame"] = UnavailableFrame(
-                "Waiting for the first for4U Frame callback to fill width, height, datasize, and pixel format.");
-            JsonData pre = new JsonData();
-            pre["width"] = width;
-            pre["height"] = height;
-            pre["crop"] = "none";
-            pre["rotationDegrees"] = 0;
-            pre["scale"] = "1:1 RGBA → JPEG on headset; MP4 is encoded on PC";
-            pre["jpegQuality"] = jpegQuality;
-            pre["framesDir"] = framesDir ?? "";
-            pre["framesJsonlPath"] = framesJsonlPath ?? "";
-            if (string.Equals(cameraMode, "3D", StringComparison.OrdinalIgnoreCase))
-            {
-                pre["layout"] = "3D side-by-side in one buffer, left half then right half";
-            }
-            else if (string.Equals(cameraMode, "RIGHT", StringComparison.OrdinalIgnoreCase))
-            {
-                pre["layout"] = "RIGHT, single eye, full buffer";
-            }
-            else
-            {
-                pre["layout"] = "LEFT, single eye, full buffer";
-            }
-
-            meta["preEncode"] = pre;
-            meta["calibration"] = CalibrationNote(width, height, false);
-            meta["timeSync"] = ApiTimeSync(0, 0, false);
-        }
-
-        public static void WriteApiFramesResult(JsonData meta, string framesDir, string framesJsonlPath,
-            int savedFrames, int requestedFps, float savedFps, int throttledDrops, int jpegQuality)
-        {
-            JsonData frames = new JsonData();
-            frames["dir"] = framesDir ?? "";
-            frames["jsonl"] = framesJsonlPath ?? "";
-            frames["savedFrames"] = savedFrames;
-            frames["requested_fps"] = requestedFps;
-            frames["saved_fps"] = savedFps.ToString("R", CultureInfo.InvariantCulture);
-            frames["jpegQuality"] = jpegQuality;
-            frames["throttledDrops"] = throttledDrops;
-            frames["throttlePolicy"] =
-                "Callbacks above requested_fps or while the JPEG writer is busy are dropped. " +
-                "Latest-frame slot only; PC builds CameraRecord_*.mp4 from frames_*/ and jsonl.";
-            frames["pcEncode"] = "Docs/for4u_frames_to_mp4.sh";
-            bool dirOk = !string.IsNullOrEmpty(framesDir) && Directory.Exists(framesDir);
-            bool jsonlOk = !string.IsNullOrEmpty(framesJsonlPath) && File.Exists(framesJsonlPath);
-            frames["dirPresent"] = dirOk;
-            frames["jsonlPresent"] = jsonlOk;
-            meta["frames"] = frames;
-            // No headset mp4 for api-frames sessions.
-            JsonData mp4 = new JsonData();
-            mp4["present"] = false;
-            mp4["path"] = "";
-            mp4["note"] = "Headset does not write MP4 for saveType=api-frames. Encode on PC.";
-            meta["mp4"] = mp4;
-        }
-
-        public static void WriteApiFrameFacts(JsonData meta, int width, int height, string pixelFormat,
-            int dataSize, int configuredFps, float measuredFps, string cameraMode, bool modeStarted)
-        {
-            JsonData frame = new JsonData();
-            frame["width"] = width;
-            frame["height"] = height;
-            frame["pixelFormat"] = pixelFormat ?? "not-read";
-            frame["datasize"] = dataSize;
-            frame["configuredFps"] = configuredFps;
-            frame["measuredFps"] = measuredFps.ToString("R", CultureInfo.InvariantCulture);
-            frame["selectedMode"] = cameraMode ?? "LEFT";
-            frame["selectedModeStarted"] = modeStarted;
-            frame["availableModes"] = "LEFT, RIGHT, 3D, Interlace";
-            frame["note"] =
-                "Width and height come from Frame.width/height when non-zero, otherwise the SetCameraFrameBufferfor4U request.";
-            meta["picoApiFrame"] = frame;
-        }
-
-        public static void WriteApiPreEncode(JsonData meta, int width, int height, string cameraMode)
-        {
-            JsonData pre = new JsonData();
-            pre["width"] = width;
-            pre["height"] = height;
-            pre["crop"] = "none";
-            pre["rotationDegrees"] = 0;
-            pre["scale"] = "1:1 RGBA buffer copied into FrameMuxer without scaling";
-            if (string.Equals(cameraMode, "3D", StringComparison.OrdinalIgnoreCase))
-            {
-                pre["layout"] = "3D side-by-side in one buffer, left half then right half";
-            }
-            else if (string.Equals(cameraMode, "RIGHT", StringComparison.OrdinalIgnoreCase))
-            {
-                pre["layout"] = "RIGHT, single eye, full buffer";
-            }
-            else
-            {
-                pre["layout"] = "LEFT, single eye, full buffer";
-            }
-
-            meta["preEncode"] = pre;
         }
 
         public static void WriteMp4Result(JsonData meta, string path)
@@ -282,32 +167,8 @@ namespace Robot
             return sync;
         }
 
-        public static JsonData ApiTimeSync(long firstSdkTimestampNs, long firstElapsedRealtimeNs, bool haveFrame)
-        {
-            JsonData sync = new JsonData();
-            sync["imageClock"] = "Frame.timestamp is exposure-start CLOCK_BOOTTIME nanoseconds.";
-            sync["trackingClock"] =
-                "elapsedRealtimeNs is CLOCK_BOOTTIME nanoseconds. timeStampNs is UTC milliseconds times 1000000.";
-            sync["sdk_timestamp_ns"] = "per_frame_in_frames_jsonl";
-            sync["video_pts_us"] = "absent_until_pc_encode";
-            sync["host_elapsedRealtimeNs_at_output"] =
-                "not_applicable; jpeg writer uses accept-time elapsedRealtimeNs, not MediaCodec dequeue";
-            if (!haveFrame)
-            {
-                sync["canAlign"] = "No frame arrived, so no image timestamp was paired with tracking.";
-                return sync;
-            }
-
-            long delta = firstElapsedRealtimeNs - firstSdkTimestampNs;
-            sync["firstFrameElapsedMinusSdkNs"] = delta;
-            sync["canAlign"] = Math.Abs(delta) < 60L * 1000000000L
-                ? "Yes, as the same CLOCK_BOOTTIME family. Compare frames.jsonl sdk_timestamp_ns with tracking elapsedRealtimeNs. Do not subtract timeStampNs."
-                : "The first-frame delta is larger than 60 seconds, so the two timestamps are not treated as one clock.";
-            return sync;
-        }
-
         /// <summary>
-        /// Shared encode/timestamp contract for Vision, api-frames, and surface probe sessions.
+        /// Shared encode/timestamp contract for Vision and surface encode sessions.
         /// </summary>
         public static void WriteEncodeTimestampContract(JsonData meta, string encodePath,
             string timestampStrategy, string eyeMode, int width, int height, int requestedFps,

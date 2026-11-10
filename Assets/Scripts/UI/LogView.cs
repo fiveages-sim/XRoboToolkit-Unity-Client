@@ -1,36 +1,56 @@
-using System.Collections.Generic;
+using System.Collections.Concurrent;
 using UnityEngine;
 using UnityEngine.UI;
 
 public class LogView : MonoBehaviour
 {
     public const int LogCacheCount = 20;
+    private const int MaxWaiting = 64;
     public Text itemTmp;
 
-    private static Queue<LogData> _waitings = new Queue<LogData>();
+    private static readonly ConcurrentQueue<LogData> Waitings = new ConcurrentQueue<LogData>();
     private static LogView _instance;
 
     private RectTransform _root;
     private ScrollRect _scrollRect;
+    private bool _change;
 
     private void Awake()
     {
+        _instance = this;
         itemTmp.gameObject.SetActive(false);
         _root = (RectTransform)itemTmp.transform.parent;
         _scrollRect = itemTmp.GetComponentInParent<ScrollRect>();
     }
 
-    public static void Push(string condition, string stackTrace, LogType type)
+    private void OnDestroy()
     {
-        LogData data = new LogData();
-        data.Condition = condition;
-        data.StackTrace = stackTrace;
-        data.LogType = type;
-        _waitings.Enqueue(data);
+        if (_instance == this)
+        {
+            _instance = null;
+        }
     }
 
+    public static void Push(string condition, string stackTrace, LogType type)
+    {
+        // No consumer mounted → drop immediately (avoids unbounded growth / OOM).
+        if (_instance == null)
+        {
+            return;
+        }
 
-    private bool _change = false;
+        if (Waitings.Count >= MaxWaiting)
+        {
+            Waitings.TryDequeue(out _);
+        }
+
+        Waitings.Enqueue(new LogData
+        {
+            Condition = condition,
+            StackTrace = stackTrace,
+            LogType = type
+        });
+    }
 
     private void Update()
     {
@@ -40,10 +60,8 @@ public class LogView : MonoBehaviour
             _change = false;
         }
 
-        while (_waitings.Count > 0)
+        while (Waitings.TryDequeue(out LogData data))
         {
-            LogData data = _waitings.Dequeue();
-
             Text item;
             if (_root.childCount > LogCacheCount)
             {
@@ -75,7 +93,7 @@ public class LogView : MonoBehaviour
         }
     }
 
-    struct LogData
+    private struct LogData
     {
         public string Condition;
         public string StackTrace;

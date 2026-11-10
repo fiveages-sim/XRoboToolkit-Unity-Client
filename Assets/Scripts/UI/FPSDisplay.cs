@@ -4,48 +4,57 @@ using UnityEngine.UI;
 
 public class FPSDisplay : MonoBehaviour
 {
+    private const long StaleMilliseconds = 1500;
+
     public Text fpsText;
-    private static float deltaTime = 0.0f;
+    private static float deltaTime;
     private static Stopwatch stopwatch;
+    private static bool hasSample;
 
     private void Awake()
     {
         stopwatch = Stopwatch.StartNew();
     }
 
+    /// <summary>Called from the tracking send thread when a packet is sent.</summary>
     public static void UpdateTime()
     {
-        var unDeltaTime = stopwatch.ElapsedMilliseconds; // Time interval (seconds)
-        stopwatch.Restart(); // reset
-        // Accumulated frame interval time
+        if (stopwatch == null)
+        {
+            stopwatch = Stopwatch.StartNew();
+        }
+
+        var unDeltaTime = stopwatch.ElapsedMilliseconds;
+        stopwatch.Restart();
         deltaTime += (unDeltaTime - deltaTime) * 0.1f;
-        //   Debug.Log("deltaTime:" + deltaTime);
+        hasSample = true;
     }
-    
+
     public static void Reset()
     {
-        if (deltaTime > 0)
+        deltaTime = 0f;
+        hasSample = false;
+        if (stopwatch != null)
         {
-            deltaTime = 0f;   
+            stopwatch.Restart();
         }
     }
 
     private void Update()
     {
-        if (fpsText != null)
+        if (fpsText == null || Time.frameCount % 10 != 0)
         {
-            if (Time.frameCount % 10 == 0)
-            {
-                var text = $"FPS: N/A";
-                // Calculate FPS
-                if (deltaTime > 0)
-                {
-                    var fps = 1000.0f / deltaTime;
-                    text = $"FPS: {fps:F1}";
-                }
-
-                fpsText.text = text;
-            }
+            return;
         }
+
+        bool stale = !hasSample || stopwatch == null || stopwatch.ElapsedMilliseconds > StaleMilliseconds;
+        if (stale || deltaTime <= 0f)
+        {
+            fpsText.text = "FPS: --";
+            return;
+        }
+
+        float fps = 1000.0f / deltaTime;
+        fpsText.text = $"FPS: {fps:F1}";
     }
 }

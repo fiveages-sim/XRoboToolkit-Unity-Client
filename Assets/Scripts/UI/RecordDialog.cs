@@ -223,11 +223,21 @@ public class RecordDialog : MonoBehaviour
 
     public void OnConfirm()
     {
+        if (!TryParseClamped(widthInputField != null ? widthInputField.text : null, 16, 8192, out int width) ||
+            !TryParseClamped(heightInputField != null ? heightInputField.text : null, 16, 8192, out int height) ||
+            !TryParseClamped(fpsInputField != null ? fpsInputField.text : null, 1, 120, out int fps) ||
+            !TryParseClamped(bitrateInputField != null ? bitrateInputField.text : null, 1, 200 * 1024 * 1024,
+                out int bitrate))
+        {
+            Toast.Show("Invalid record parameters");
+            return;
+        }
+
         gameObject.SetActive(false);
-        ResolutionWidth = int.Parse(widthInputField.text);
-        ResolutionHeight = int.Parse(heightInputField.text);
-        Fps = int.Parse(fpsInputField.text);
-        Bitrate = int.Parse(bitrateInputField.text);
+        ResolutionWidth = width;
+        ResolutionHeight = height;
+        Fps = fps;
+        Bitrate = bitrate;
         RecordTrackingData = trackingDataTog != null && trackingDataTog.isOn;
         ExpImage = _draftExpImage;
         SaveFlagPrefs();
@@ -849,5 +859,21 @@ public class RecordDialog : MonoBehaviour
 
             _targetFpsButton.transform.SetAsLastSibling();
         }
+    }
+
+    private static bool TryParseClamped(string text, int minInclusive, int maxInclusive, out int value)
+    {
+        value = 0;
+        if (string.IsNullOrWhiteSpace(text) || !int.TryParse(text.Trim(), out value))
+        {
+            return false;
+        }
+
+        if (value < minInclusive || value > maxInclusive)
+        {
+            value = Mathf.Clamp(value, minInclusive, maxInclusive);
+        }
+
+        return true;
     }
 }

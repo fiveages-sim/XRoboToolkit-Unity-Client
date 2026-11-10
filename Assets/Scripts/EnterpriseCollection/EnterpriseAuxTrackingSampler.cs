@@ -12,14 +12,21 @@ namespace Robot
 {
     /// <summary>
     /// Samples Hand / Body / Motion on a dedicated thread into latest-only caches
-    /// for Enterprise direct main-path packing. Rate follows SharedEnterpriseSampleHz.
-    /// Failures only skip that stream; never blocks Head/Controller sampling.
+    /// for Enterprise direct main-path packing. Body/Motion follow SharedEnterpriseSampleHz;
+    /// Hand can use a lower handSampleHz to avoid 5KB JSON work at panel rate.
+    /// Failures clear that stream's cache (no stale Hand left attached to Head packets).
+    /// Wire protocol unchanged — missing Hand key means no fresh sample (same as before first hit).
     /// </summary>
     public class EnterpriseAuxTrackingSampler : MonoBehaviour
     {
         private const string Tag = "EnterpriseAuxTrackingSampler";
 
         [SerializeField] private bool autoStart = true;
+        /// <summary>
+        /// Cap for Hand sampling. 0 = follow SharedEnterpriseSampleHz (recommended);
+        /// TcpHandler.autoThrottle then lowers via SharedAuxThrottleHz under bandwidth pressure.
+        /// </summary>
+        [SerializeField] private int handSampleHz = 0;
 
         private Thread _auxThread;
         private volatile bool _running;
@@ -79,7 +86,8 @@ namespace Robot
                 Name = nameof(EnterpriseAuxTrackingSampler)
             };
             _auxThread.Start();
-            Debug.Log($"{Tag} started (hz follows EnterpriseSampleHz)");
+            Debug.Log($"{Tag} started (handHz={(handSampleHz > 0 ? handSampleHz.ToString() : "enterprise")}, " +
+                      $"throttleCap={TcpHandler.SharedAuxThrottleHz})");
         }
 
         public void StopAuxLoop()
@@ -152,14 +160,27 @@ namespace Robot
 #if PICO_PLATFORM
             AndroidJNI.AttachCurrentThread();
 #endif
-            long nextSampleTicks = Stopwatch.GetTimestamp();
+            long nextLoopTicks = Stopwatch.GetTimestamp();
+            long nextHandTicks = Stopwatch.GetTimestamp();
+            long nextBodyTicks = Stopwatch.GetTimestamp();
+            long nextMotionTicks = Stopwatch.GetTimestamp();
+            long handFailSinceTicks = 0;
+            long handPublishCount = 0;
+            long handFailCount = 0;
+            long lastDiagTicks = Stopwatch.GetTimestamp();
+            // Keep last good Hand briefly across SDK gaps so high-rate polling does not
+            // ClearHand on every miss (PICO joints often update ~72–90Hz).
+            const double handFailClearSeconds = 0.05;
             while (_running)
             {
                 if (!IsSamplerActive())
                 {
                     ClearCaches();
                     Thread.Sleep(20);
-                    nextSampleTicks = Stopwatch.GetTimestamp();
+                    nextLoopTicks = Stopwatch.GetTimestamp();
+                    nextHandTicks = nextLoopTicks;
+                    nextBodyTicks = nextLoopTicks;
+                    nextMotionTicks = nextLoopTicks;
                     continue;
                 }
 
@@ -170,49 +191,130 @@ namespace Robot
                 {
                     ClearCaches();
                     Thread.Sleep(20);
-                    nextSampleTicks = Stopwatch.GetTimestamp();
+                    nextLoopTicks = Stopwatch.GetTimestamp();
+                    nextHandTicks = nextLoopTicks;
+                    nextBodyTicks = nextLoopTicks;
+                    nextMotionTicks = nextLoopTicks;
                     continue;
                 }
 
-                if (wantHand && _trackingData.TryBuildHandJson(out JsonData handJson))
+                long nowTicks = Stopwatch.GetTimestamp();
+                int enterpriseHz = EnterpriseCollectionRecorder.SharedEnterpriseSampleHz;
+                int throttleHz = TcpHandler.SharedAuxThrottleHz;
+                int configuredHandHz = handSampleHz > 0 ? handSampleHz : enterpriseHz;
+                // Auto-throttle never raises above inspector cap; can lower toward min.
+                int effectiveHandHz = configuredHandHz > 0
+                    ? Math.Min(configuredHandHz, throttleHz)
+                    : throttleHz;
+                int effectiveBodyMotionHz = enterpriseHz > 0
+                    ? Math.Min(enterpriseHz, throttleHz)
+                    : throttleHz;
+
+                // Hand on its own cadence. Only clear after sustained failures so we do not
+                // thrash when polling faster than the SDK joint rate (~90Hz typical).
+                if (wantHand && nowTicks >= nextHandTicks)
                 {
-                    PublishHand(handJson.ToJson());
+                    if (_trackingData.TryBuildHandJson(out JsonData handJson))
+                    {
+                        PublishHand(handJson.ToJson());
+                        handFailSinceTicks = 0;
+                        handPublishCount++;
+                    }
+                    else
+                    {
+                        handFailCount++;
+                        if (handFailSinceTicks == 0)
+                        {
+                            handFailSinceTicks = nowTicks;
+                        }
+                        else if ((nowTicks - handFailSinceTicks) >
+                                 handFailClearSeconds * Stopwatch.Frequency)
+                        {
+                            ClearHand();
+                            handFailSinceTicks = nowTicks;
+                        }
+                    }
+
+                    AdvanceDue(ref nextHandTicks, nowTicks, effectiveHandHz);
+                }
+                else if (!wantHand)
+                {
+                    ClearHand();
+                    handFailSinceTicks = 0;
                 }
 
-                if (wantBody && _trackingData.TryBuildBodyJson(out JsonData bodyJson))
+                if (wantBody && nowTicks >= nextBodyTicks)
                 {
-                    PublishBody(bodyJson.ToJson());
+                    if (_trackingData.TryBuildBodyJson(out JsonData bodyJson))
+                    {
+                        PublishBody(bodyJson.ToJson());
+                    }
+                    else
+                    {
+                        ClearBody();
+                    }
+
+                    AdvanceDue(ref nextBodyTicks, nowTicks, effectiveBodyMotionHz);
                 }
                 else if (!wantBody)
                 {
                     ClearBody();
                 }
 
-                if (wantMotion && _trackingData.TryBuildMotionJson(out JsonData motionJson))
+                if (wantMotion && nowTicks >= nextMotionTicks)
                 {
-                    PublishMotion(motionJson.ToJson());
+                    if (_trackingData.TryBuildMotionJson(out JsonData motionJson))
+                    {
+                        PublishMotion(motionJson.ToJson());
+                    }
+                    else
+                    {
+                        ClearMotion();
+                    }
+
+                    AdvanceDue(ref nextMotionTicks, nowTicks, effectiveBodyMotionHz);
                 }
                 else if (!wantMotion)
                 {
                     ClearMotion();
                 }
 
-                if (!wantHand)
+                // Loop wake: max of enabled aux cadences (Hand throttled separately).
+                int loopHz = 0;
+                if (wantHand)
                 {
-                    ClearHand();
+                    loopHz = Math.Max(loopHz, effectiveHandHz);
                 }
 
-                int sampleHz = EnterpriseCollectionRecorder.SharedEnterpriseSampleHz;
-                if (sampleHz <= 0)
+                if (wantBody || wantMotion)
+                {
+                    loopHz = Math.Max(loopHz, effectiveBodyMotionHz);
+                }
+
+                if (loopHz <= 0)
                 {
                     Thread.Sleep(50);
-                    nextSampleTicks = Stopwatch.GetTimestamp();
+                    nextLoopTicks = Stopwatch.GetTimestamp();
                     continue;
                 }
 
-                long intervalTicks = Math.Max(1, (long)Math.Round(Stopwatch.Frequency / (double)sampleHz));
-                nextSampleTicks += intervalTicks;
-                long remainingTicks = nextSampleTicks - Stopwatch.GetTimestamp();
+                double diagElapsed = (nowTicks - lastDiagTicks) / (double)Stopwatch.Frequency;
+                if (diagElapsed >= 1.0)
+                {
+                    double pubHz = handPublishCount / diagElapsed;
+                    double failHz = handFailCount / diagElapsed;
+                    Debug.Log($"{Tag}hand diag: effectiveHz={effectiveHandHz} " +
+                              $"throttle={throttleHz} enterprise={enterpriseHz} " +
+                              $"configured={(handSampleHz > 0 ? handSampleHz.ToString() : "0/follow")} " +
+                              $"publishHz={pubHz:F1} failHz={failHz:F1}");
+                    handPublishCount = 0;
+                    handFailCount = 0;
+                    lastDiagTicks = nowTicks;
+                }
+
+                long intervalTicks = Math.Max(1, (long)Math.Round(Stopwatch.Frequency / (double)loopHz));
+                nextLoopTicks += intervalTicks;
+                long remainingTicks = nextLoopTicks - Stopwatch.GetTimestamp();
                 if (remainingTicks > 0)
                 {
                     int sleepMs = (int)(remainingTicks * 1000 / Stopwatch.Frequency);
@@ -227,9 +329,24 @@ namespace Robot
                 }
                 else
                 {
-                    nextSampleTicks = Stopwatch.GetTimestamp();
+                    nextLoopTicks = Stopwatch.GetTimestamp();
                     Thread.Yield();
                 }
+            }
+        }
+
+        private static void AdvanceDue(ref long nextDueTicks, long nowTicks, int hz)
+        {
+            if (hz <= 0)
+            {
+                return;
+            }
+
+            long interval = Math.Max(1, (long)Math.Round(Stopwatch.Frequency / (double)hz));
+            nextDueTicks += interval;
+            if (nextDueTicks < nowTicks)
+            {
+                nextDueTicks = nowTicks;
             }
         }
 
@@ -240,6 +357,8 @@ namespace Robot
                 s_latestHandJson = json;
                 s_handSampleSeq++;
             }
+
+            TcpHandler.NotifyTrackingSampleAvailable();
         }
 
         private static void PublishBody(string json)
@@ -249,6 +368,8 @@ namespace Robot
                 s_latestBodyJson = json;
                 s_bodySampleSeq++;
             }
+
+            TcpHandler.NotifyTrackingSampleAvailable();
         }
 
         private static void PublishMotion(string json)
@@ -258,32 +379,64 @@ namespace Robot
                 s_latestMotionJson = json;
                 s_motionSampleSeq++;
             }
+
+            TcpHandler.NotifyTrackingSampleAvailable();
         }
 
         private static void ClearHand()
         {
+            bool cleared = false;
             lock (HandLock)
             {
-                s_latestHandJson = null;
-                s_handSampleSeq = 0;
+                if (s_latestHandJson != null || s_handSampleSeq != 0)
+                {
+                    s_latestHandJson = null;
+                    s_handSampleSeq = 0;
+                    cleared = true;
+                }
+            }
+
+            if (cleared)
+            {
+                TcpHandler.NotifyTrackingSampleAvailable();
             }
         }
 
         private static void ClearBody()
         {
+            bool cleared = false;
             lock (BodyLock)
             {
-                s_latestBodyJson = null;
-                s_bodySampleSeq = 0;
+                if (s_latestBodyJson != null || s_bodySampleSeq != 0)
+                {
+                    s_latestBodyJson = null;
+                    s_bodySampleSeq = 0;
+                    cleared = true;
+                }
+            }
+
+            if (cleared)
+            {
+                TcpHandler.NotifyTrackingSampleAvailable();
             }
         }
 
         private static void ClearMotion()
         {
+            bool cleared = false;
             lock (MotionLock)
             {
-                s_latestMotionJson = null;
-                s_motionSampleSeq = 0;
+                if (s_latestMotionJson != null || s_motionSampleSeq != 0)
+                {
+                    s_latestMotionJson = null;
+                    s_motionSampleSeq = 0;
+                    cleared = true;
+                }
+            }
+
+            if (cleared)
+            {
+                TcpHandler.NotifyTrackingSampleAvailable();
             }
         }
 

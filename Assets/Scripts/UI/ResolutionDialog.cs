@@ -42,13 +42,32 @@ public class ResolutionDialog : MonoBehaviour
 
     public void OnConfirm()
     {
+        if (!TryParseClamped(widthInputField != null ? widthInputField.text : null, 16, 8192, out int width) ||
+            !TryParseClamped(heightInputField != null ? heightInputField.text : null, 16, 8192, out int height))
+        {
+            Toast.Show("Invalid resolution");
+            return;
+        }
+
         gameObject.SetActive(false);
-        ResolutionWidth = int.Parse(widthInputField.text);
-        ResolutionHeight = int.Parse(heightInputField.text);
+        ResolutionWidth = width;
+        ResolutionHeight = height;
         if (_confirm != null)
         {
             _confirm.Invoke(ResolutionWidth, ResolutionHeight);
         }
+    }
+
+    private static bool TryParseClamped(string text, int minInclusive, int maxInclusive, out int value)
+    {
+        value = 0;
+        if (string.IsNullOrWhiteSpace(text) || !int.TryParse(text.Trim(), out value))
+        {
+            return false;
+        }
+
+        value = Mathf.Clamp(value, minInclusive, maxInclusive);
+        return true;
     }
 
     public void OnCancel()

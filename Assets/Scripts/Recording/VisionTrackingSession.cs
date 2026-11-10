@@ -56,12 +56,18 @@ namespace Robot
         private int _bitrate;
         private string _videoPath;
         private string _trackingPath;
-        private string _metaPath;
+        private string _sessionDir;
         private string _pendingFail;
-        private StreamWriter _writer;
+        private CollectionSessionWriter _sessionWriter;
+        private TrackingConfigSnapshot _trackingSnapshot;
         private int _trackingLines;
         private int _trackingSamples;
         private int _anomalyCount;
+        private long _visionHeadSeq;
+        private long _visionControllerSeq;
+        private long _visionHandSeq;
+        private long _visionBodySeq;
+        private long _visionMotionSeq;
         private JsonData _trackingJson = new JsonData();
         private TrackingData _trackingData = new TrackingData();
         private JsonData _meta = new JsonData();
@@ -130,6 +136,7 @@ namespace Robot
 #endif
             TrackingWriteEnabled = false;
             CloseTrackingWriter();
+            FinalizeSessionWriter(RecordingSessionPhase.Failed, reason ?? "force_reset");
             _acceptStart = false;
             _finalized = true;
             _stoppingSince = -1f;
@@ -181,16 +188,24 @@ namespace Robot
             _anomalyCount = 0;
             _videoPath = "";
             _trackingPath = "";
-            _metaPath = "";
+            _sessionDir = "";
+            _sessionWriter = null;
+            _visionHeadSeq = 0;
+            _visionControllerSeq = 0;
+            _visionHandSeq = 0;
+            _visionBodySeq = 0;
+            _visionMotionSeq = 0;
             TrackingWriteEnabled = false;
             SessionId = DateTime.Now.ToString("yyyyMMdd_HHmmss");
             string collisionSuffix = DateTime.Now.ToString("fff");
-            if (File.Exists(Path.Combine(DownloadDir, "CameraRecord_" + SessionId + ".mp4")) ||
-                File.Exists(Path.Combine(DownloadDir, "trackingData_" + SessionId + ".txt")) ||
-                File.Exists(Path.Combine(DownloadDir, "recording_meta_" + SessionId + ".json")))
+            string root = Path.Combine(DownloadDir, CollectionSessionWriter.RootFolderName);
+            string candidateSession = Path.Combine(root, "session_" + SessionId);
+            if (Directory.Exists(candidateSession))
             {
                 SessionId = SessionId + "_" + collisionSuffix;
             }
+
+            _trackingSnapshot = TrackingConfigSnapshot.CaptureFromPanel();
             CameraHandle.SetLogContext(SessionId);
             string pipelineError = CapturePipeline.SelfCheck();
             if (pipelineError != null)
@@ -213,6 +228,9 @@ namespace Robot
             _meta["bitrate"] = bitrate;
             _meta["status"] = "starting";
             _meta["syncHint"] = SyncHint();
+            _meta["sessionDir"] = _sessionDir;
+            _meta["collectionSchemaVersion"] = CollectionSessionWriter.SchemaVersion;
+            _meta["tracking_config_at_start"] = _trackingSnapshot.ToJson();
             // AAR encoder is documented as ~5 Mbps; dialog bitrate may be ignored by capturelib.
             int bitrateBps = bitrate > 0 ? bitrate : 5 * 1000 * 1000;
             CaptureReport.WriteEncodeTimestampContract(_meta, "vision-startrecord",
@@ -230,6 +248,23 @@ namespace Robot
             {
                 Finish(RecordingSessionPhase.Failed, diskError ?? "disk budget failed", false);
                 return;
+            }
+
+            if (_tracking || _vision)
+            {
+                _sessionWriter = new CollectionSessionWriter(true, DownloadDir);
+                _sessionWriter.Start(
+                    _trackingSnapshot,
+                    EnterpriseCollectionRecorder.SharedEnterpriseSampleHz,
+                    90,
+                    _vision,
+                    SystemInfo.deviceModel,
+                    Utils.IsPico4U(),
+                    "session_" + SessionId);
+                _sessionWriter.SetDiskBudget(diskOk, free, required);
+                _sessionDir = _sessionWriter.SessionDir;
+                _meta["sessionDir"] = _sessionDir;
+                _meta["session_id"] = _sessionWriter.SessionId;
             }
 
             WriteMeta();
@@ -297,7 +332,8 @@ namespace Robot
 
         public void WriteTrackingSample()
         {
-            if (!TrackingWriteEnabled || _writer == null || _finalized || Phase != RecordingSessionPhase.Recording)
+            if (!TrackingWriteEnabled || _sessionWriter == null || _finalized ||
+                Phase != RecordingSessionPhase.Recording)
             {
                 return;
             }
@@ -307,40 +343,91 @@ namespace Robot
                 _trackingData.Get(ref _trackingJson);
                 _trackingJson["elapsedRealtimeNs"] = Utils.GetElapsedRealtimeNs();
                 _trackingJson["sessionId"] = SessionId;
-                _writer.WriteLine(_trackingJson.ToJson());
                 _trackingLines++;
                 _trackingSamples++;
-                if (TrackingData.HeadOn && !_trackingJson.ContainsKey("Head"))
+
+                // Per-source files follow the start snapshot, not live panel toggles.
+                if (_trackingSnapshot.Head)
                 {
-                    _anomalyCount++;
+                    WriteVisionSourceSample("head", "head_pose", ref _visionHeadSeq,
+                        _trackingJson.ContainsKey("Head") ? _trackingJson["Head"] : null);
+                    if (!_trackingJson.ContainsKey("Head"))
+                    {
+                        _anomalyCount++;
+                    }
                 }
 
-                if (TrackingData.ControllerOn && !_trackingJson.ContainsKey("Controller"))
+                if (_trackingSnapshot.Controller)
                 {
-                    _anomalyCount++;
+                    WriteVisionSourceSample("controller", "controller_pose", ref _visionControllerSeq,
+                        _trackingJson.ContainsKey("Controller") ? _trackingJson["Controller"] : null);
+                    if (!_trackingJson.ContainsKey("Controller"))
+                    {
+                        _anomalyCount++;
+                    }
                 }
 
-                if (TrackingData.HandTrackingOn && !_trackingJson.ContainsKey("Hand"))
+                if (_trackingSnapshot.Hand)
                 {
-                    _anomalyCount++;
+                    WriteVisionSourceSample("hand", "hand_pose", ref _visionHandSeq,
+                        _trackingJson.ContainsKey("Hand") ? _trackingJson["Hand"] : null);
+                    if (!_trackingJson.ContainsKey("Hand"))
+                    {
+                        _anomalyCount++;
+                    }
                 }
 
-                if (TrackingData.TrackingTypeValue == TrackingData.TrackingType.Body &&
-                    !_trackingJson.ContainsKey("Body"))
+                if (_trackingSnapshot.FullBody)
                 {
-                    _anomalyCount++;
+                    WriteVisionSourceSample("full_body", "body_pose", ref _visionBodySeq,
+                        _trackingJson.ContainsKey("Body") ? _trackingJson["Body"] : null);
+                    if (!_trackingJson.ContainsKey("Body"))
+                    {
+                        _anomalyCount++;
+                    }
                 }
 
-                if (TrackingData.TrackingTypeValue == TrackingData.TrackingType.Motion &&
-                    !_trackingJson.ContainsKey("Motion"))
+                if (_trackingSnapshot.MotionTracker)
                 {
-                    _anomalyCount++;
+                    WriteVisionSourceSample("motion_tracker", "motion_tracker", ref _visionMotionSeq,
+                        _trackingJson.ContainsKey("Motion") ? _trackingJson["Motion"] : null);
+                    if (!_trackingJson.ContainsKey("Motion"))
+                    {
+                        _anomalyCount++;
+                    }
                 }
             }
             catch (Exception exception)
             {
                 _pendingFail = "tracking write failed: " + exception.Message;
             }
+        }
+
+        private void WriteVisionSourceSample(string sourceKey, string kind, ref long seq, JsonData data)
+        {
+            if (_sessionWriter == null)
+            {
+                return;
+            }
+
+            bool success = data != null;
+            JsonData envelope = new JsonData();
+            envelope["source"] = "vision";
+            envelope["kind"] = kind;
+            envelope["seq"] = ++seq;
+            envelope["captureUnixTimeMs"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            envelope["elapsedRealtimeNs"] = Utils.GetElapsedRealtimeNs();
+            envelope["success"] = success;
+            if (success)
+            {
+                envelope["data"] = data;
+            }
+            else
+            {
+                envelope["error"] = kind + " missing in TrackingData.Get";
+            }
+
+            _sessionWriter.Enqueue(sourceKey, envelope.ToJson(), success);
         }
 
         private float _diskCheckTimer;
@@ -436,28 +523,10 @@ namespace Robot
                     yield break;
                 }
 
-                string driveError = CameraHandle.DrivePipelineWithoutCallback("no-callback");
-                if (_finalized)
-                {
-                    yield break;
-                }
-
-                if (driveError != null)
-                {
-                    Finish(RecordingSessionPhase.Failed,
-                        "SetConfig/StartPreview failed without capture callbacks: " + driveError + " " +
-                        DiagnosticSnapshot(),
-                        false);
-                    yield break;
-                }
-
-                if (Phase == RecordingSessionPhase.Starting)
-                {
-                    Finish(RecordingSessionPhase.Failed,
-                        "StartRecord was not reached after SetConfig and StartPreview. " + DiagnosticSnapshot(),
-                        false);
-                    yield break;
-                }
+                // Do not synthesize OPENED/CONFIGURED here. The callback is still
+                // CAPTURE_STATE_CAMERA_OPENING (mCaptureState=0); configure and
+                // startPreview both fail and StartRecord then writes an empty MP4.
+                // Real OPENED/CONFIGURED/PREVIEWING callbacks drive SetConfig and preview.
             }
             else
             {
@@ -494,18 +563,7 @@ namespace Robot
                     " configApplied=" + CameraHandle.ConfigApplied +
                     " previewEverStarted=" + CameraHandle.PreviewEverStarted, false);
 
-                if (!_recoveryUsed && elapsed >= RecoveryDelaySeconds &&
-                    Phase == RecordingSessionPhase.Starting && !CameraHandle.PreviewEverStarted)
-                {
-                    _recoveryUsed = true;
-                    string recoveryError = CameraHandle.DrivePipelineWithoutCallback("polling");
-                    if (recoveryError != null)
-                    {
-                        Finish(RecordingSessionPhase.Failed,
-                            "polling pipeline failed: " + recoveryError + " " + DiagnosticSnapshot(), false);
-                        yield break;
-                    }
-                }
+                // No synthetic OPENED/CONFIGURED. configure fails while mCaptureState is still 0.
             }
 
             if (!_finalized && Phase == RecordingSessionPhase.Starting)
@@ -570,12 +628,20 @@ namespace Robot
             try
             {
                 EnsureDownloadDir();
-                _videoPath = Path.Combine(DownloadDir, "CameraRecord_" + SessionId + ".mp4");
+                if (string.IsNullOrEmpty(_sessionDir))
+                {
+                    _sessionDir = Path.Combine(DownloadDir, CollectionSessionWriter.RootFolderName,
+                        "session_" + SessionId);
+                    Directory.CreateDirectory(_sessionDir);
+                }
+
+                _videoPath = Path.Combine(_sessionDir, CollectionSessionWriter.VideoFile);
                 _videoStartUtc = DateTime.UtcNow.ToString("o");
                 _videoStartElapsedRealtimeNs = Utils.GetElapsedRealtimeNs();
                 _videoStartPredictTimeUs = PXR_Enterprise.GetPredictedDisplayTime() * 1000.0;
                 _videoStartUtcNs = Utils.GetCurrentTimestamp();
                 _meta["videoPath"] = _videoPath;
+                _sessionWriter?.SetVideoInfo(true, _videoPath, 0, "vision-startrecord");
                 _meta["videoStartUtc"] = _videoStartUtc;
                 _meta["videoStartUtcNs"] = _videoStartUtcNs;
                 _meta["videoStartElapsedRealtimeNs"] = _videoStartElapsedRealtimeNs;
@@ -606,47 +672,42 @@ namespace Robot
 
         private void OpenTrackingWriter()
         {
-            EnsureDownloadDir();
-            _trackingPath = Path.Combine(DownloadDir, "trackingData_" + SessionId + ".txt");
-            _writer = new StreamWriter(_trackingPath, false);
-            _writer.AutoFlush = true;
+            if (_sessionWriter == null)
+            {
+                throw new InvalidOperationException("CollectionSessionWriter missing for tracking");
+            }
+
+            _sessionDir = _sessionWriter.SessionDir;
+            _trackingPath = _sessionDir;
             _trackingStartUtc = DateTime.UtcNow.ToString("o");
             long elapsed = Utils.GetElapsedRealtimeNs();
             double predictUs = PXR_Enterprise.GetPredictedDisplayTime() * 1000.0;
             long utcNs = Utils.GetCurrentTimestamp();
-            JsonData header = new JsonData();
-            header["notice"] =
-                "This is the timestamp and head pose information when obtaining the image for the first frame.";
-            header["timeStampNs"] = utcNs;
-            header["sessionId"] = SessionId;
-            header["elapsedRealtimeNs"] = elapsed;
-            header["predictTime"] = predictUs;
-            header["predictTimeUs"] = predictUs;
-            header["videoPath"] = _videoPath ?? "";
-            header["clockNote"] = SyncHint();
             try
             {
-                header["cameraExtrinsics"] = CameraHandle.GetCameraExtrinsics();
-                header["cameraIntrinsics"] = CameraHandle.GetCameraIntrinsics(_width, _height);
+                _meta["cameraExtrinsics"] = CameraHandle.GetCameraExtrinsics();
+                _meta["cameraIntrinsics"] = CameraHandle.GetCameraIntrinsics(_width, _height);
             }
             catch (Exception exception)
             {
-                header["cameraExtrinsics"] = "";
-                header["cameraIntrinsics"] = "";
-                header["cameraParamError"] = exception.Message;
+                _meta["cameraExtrinsics"] = "";
+                _meta["cameraIntrinsics"] = "";
+                _meta["cameraParamError"] = exception.Message;
                 LogEvent("TrackingWriterOpened", "camera-param-error=" + exception.Message, true);
             }
 
-            _writer.WriteLine(header.ToJson());
-            _trackingLines = 1;
+            _trackingLines = 0;
             _trackingStarted = true;
             TrackingWriteEnabled = true;
-            _meta["trackingPath"] = _trackingPath;
+            _meta["trackingPath"] = _sessionDir;
+            _meta["sessionDir"] = _sessionDir;
             _meta["trackingStartUtc"] = _trackingStartUtc;
             _meta["trackingStartUtcNs"] = utcNs;
             _meta["trackingStartElapsedRealtimeNs"] = elapsed;
             _meta["trackingStartPredictTimeUs"] = predictUs;
-            LogEvent("TrackingWriterOpened", "path=" + _trackingPath, false);
+            _meta["clockNote"] = SyncHint();
+            WriteMeta();
+            LogEvent("TrackingWriterOpened", "session=" + _sessionDir, false);
         }
 
         private void ConfirmRecording(string source)
@@ -921,18 +982,18 @@ namespace Robot
             _meta["trackingSamples"] = _trackingSamples;
             _meta["anomalyCount"] = _anomalyCount;
             _meta["videoBytes"] = FileLength(_videoPath);
-            _meta["trackingBytes"] = FileLength(_trackingPath);
-            WriteMeta();
+            _meta["trackingSamples"] = _trackingSamples;
+            FinalizeSessionWriter(finalPhase, reason);
+            // Session writer already flushed final meta.json; keep capture status in memory only.
             Phase = RecordingSessionPhase.Idle;
 
             string summary = "status=" + _meta["status"] + " reason=" + reason +
                              (string.IsNullOrEmpty(validationError) ? "" : " validation=" + validationError);
             long videoBytes = FileLength(_videoPath);
-            long trackingBytes = FileLength(_trackingPath);
             if (finalPhase == RecordingSessionPhase.Completed)
             {
                 LogEvent("SessionCompleted", summary, false);
-                string saved = "Saved session=" + SessionId;
+                string saved = "Saved session=" + (_sessionDir ?? SessionId);
                 if (_vision)
                 {
                     saved += " video=" + _videoPath + " bytes=" + videoBytes;
@@ -940,17 +1001,19 @@ namespace Robot
 
                 if (_tracking)
                 {
-                    saved += " tracking=" + _trackingPath + " bytes=" + trackingBytes;
+                    saved += " trackingSamples=" + _trackingSamples;
                 }
 
                 LogWindow.Info(saved);
-                Toast.Show("Saved " + FormatBytes(videoBytes > 0 ? videoBytes : trackingBytes));
+                Toast.Show(_vision
+                    ? "Saved " + FormatBytes(videoBytes)
+                    : "Saved tracking");
             }
             else
             {
-                LogEvent("SessionFailed", summary + " " + DiagnosticSnapshot(), true);
-                LogWindow.Error("Session failed " + SessionId + " " + reason);
-                Toast.Show(TrimToast(reason));
+                Debug.LogError("[RecordSession] " + summary + " " + DiagnosticSnapshot());
+                LogWindow.Error("Record failed " + ShortReason(validationError ?? reason));
+                Toast.Show(ShortReason(validationError ?? reason));
             }
 
             SetVisual("idle");
@@ -1000,19 +1063,15 @@ namespace Robot
                     return "tracking was requested but the writer did not open";
                 }
 
-                if (!File.Exists(_trackingPath))
+                if (string.IsNullOrEmpty(_sessionDir) || !Directory.Exists(_sessionDir))
                 {
-                    return "tracking file missing: " + _trackingPath;
+                    return "session dir missing: " + _sessionDir;
                 }
 
                 if (_trackingSamples < 1)
                 {
-                    return "tracking file has no samples: " + _trackingPath;
+                    return "tracking has no samples in session: " + _sessionDir;
                 }
-            }
-            else if (!string.IsNullOrEmpty(_trackingPath) && File.Exists(_trackingPath))
-            {
-                return "tracking was off but a tracking file exists";
             }
 
             return null;
@@ -1050,41 +1109,66 @@ namespace Robot
 
         private void CloseTrackingWriter()
         {
-            if (_writer == null)
+            if (!TrackingWriteEnabled && !_trackingStarted)
             {
                 return;
             }
 
-            try
+            TrackingWriteEnabled = false;
+            LogEvent("TrackingWriterClosed",
+                "session=" + _sessionDir + " lines=" + _trackingLines + " samples=" + _trackingSamples +
+                " anomalies=" + _anomalyCount, false);
+        }
+
+        private void FinalizeSessionWriter(RecordingSessionPhase finalPhase, string reason)
+        {
+            if (_sessionWriter == null)
             {
-                _writer.Flush();
-                _writer.Close();
-                LogEvent("TrackingWriterClosed",
-                    "path=" + _trackingPath + " lines=" + _trackingLines + " samples=" + _trackingSamples +
-                    " anomalies=" + _anomalyCount, false);
+                return;
             }
-            catch (Exception exception)
+
+            long videoBytes = FileLength(_videoPath);
+            _sessionWriter.SetVideoInfo(_videoStarted && videoBytes > 0, _videoPath, videoBytes,
+                _vision ? "vision-startrecord" : "tracking-only");
+            _sessionWriter.SetCaptureExtra(_meta);
+            string status;
+            string interrupt;
+            if (finalPhase == RecordingSessionPhase.Completed)
             {
-                LogEvent("TrackingWriterClosed", "exception=" + exception.Message, true);
+                status = "completed";
+                interrupt = "none";
             }
-            finally
+            else if (reason != null && reason.IndexOf("disk", StringComparison.OrdinalIgnoreCase) >= 0)
             {
-                _writer = null;
-                TrackingWriteEnabled = false;
+                status = "aborted_disk";
+                interrupt = "disk";
             }
+            else if (finalPhase == RecordingSessionPhase.FailedPartial)
+            {
+                status = "failed";
+                interrupt = "exception";
+            }
+            else
+            {
+                status = "failed";
+                interrupt = "exception";
+            }
+
+            _sessionWriter.Stop(status, reason ?? "", interrupt, reason ?? "", 2000);
+            _sessionWriter = null;
         }
 
         private void WriteMeta()
         {
             try
             {
-                EnsureDownloadDir();
-                if (string.IsNullOrEmpty(_metaPath))
+                if (_sessionWriter == null)
                 {
-                    _metaPath = Path.Combine(DownloadDir, "recording_meta_" + SessionId + ".json");
+                    return;
                 }
 
-                File.WriteAllText(_metaPath, _meta.ToJson());
+                _sessionWriter.SetCaptureExtra(_meta);
+                _sessionWriter.FlushMeta();
             }
             catch (Exception exception)
             {
@@ -1205,13 +1289,12 @@ namespace Robot
 
         private void LogEvent(string eventName, string detail, bool error)
         {
-            // L3 diagnostics go to logcat; L1/L2 user lines are written explicitly via LogWindow.
+            // Diagnostics stay in logcat. User toast/LogWindow lines are explicit and short.
             string message = "session=" + SessionId + " event=" + eventName + " t=" + DateTime.UtcNow.ToString("o") +
                              " " + detail;
             if (error)
             {
                 Debug.LogError("[RecordSession] " + message);
-                LogWindow.Error("session=" + SessionId + " " + eventName + " " + detail);
             }
             else
             {
@@ -1252,14 +1335,41 @@ namespace Robot
             }
         }
 
-        private static string TrimToast(string reason)
+        private static string ShortReason(string reason)
         {
             if (string.IsNullOrEmpty(reason))
             {
                 return "Record failed";
             }
 
-            return reason.Length > 180 ? reason.Substring(0, 180) : reason;
+            string text = reason;
+            int path = text.IndexOf("/sdcard", StringComparison.Ordinal);
+            if (path >= 0)
+            {
+                text = text.Substring(0, path).Trim().TrimEnd(':');
+            }
+
+            if (text.IndexOf("moov", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return "MP4 not finalized";
+            }
+
+            if (text.IndexOf("timeout", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return "Record timeout";
+            }
+
+            if (text.IndexOf("permission", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return "Camera permission denied";
+            }
+
+            if (text.Length > 42)
+            {
+                text = text.Substring(0, 41) + "…";
+            }
+
+            return text;
         }
     }
 }
