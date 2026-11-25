@@ -33,6 +33,15 @@ public class CustomButton : MonoBehaviour, IPointerClickHandler
         _image.color = On ? selectedColor : _defaultColor;
     }
 
+    /// <summary>
+    /// Update visual state and invoke OnChange (e.g. Listen-off from RemoteCameraWindow close).
+    /// </summary>
+    public void SetOnAndNotify(bool value)
+    {
+        SetOn(value);
+        OnChange?.Invoke(value);
+    }
+
     public void SetVisual(bool engaged, bool recording, string label)
     {
         On = engaged;

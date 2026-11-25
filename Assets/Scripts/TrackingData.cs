@@ -175,16 +175,47 @@ namespace Robot
         }
 
         /// <summary>
+        /// Per-side status from one GetJointLocations pair. Used for L/R isActive diag
+        /// and true-rate estimation (raw vs quantized fingerprint, palm delta).
+        /// </summary>
+        public struct HandSampleInfo
+        {
+            public bool LeftOk;
+            public bool RightOk;
+            public uint LeftIsActive;
+            public uint RightIsActive;
+            /// <summary>OpenXR palm joint (index 0) when LeftOk and joints present.</summary>
+            public bool LeftPalmValid;
+            public Vector3 LeftPalm;
+            public bool RightPalmValid;
+            public Vector3 RightPalm;
+            /// <summary>Full float-bit fingerprint (detects any SDK buffer change).</summary>
+            public ulong RawFingerprint;
+            /// <summary>
+            /// Palm |Δxyz| vs previous sample (meters). -1 if no previous / no palm.
+            /// Near 0 ⇒ repeat poll of same logical frame; larger ⇒ real motion or new frame.
+            /// </summary>
+            public float PalmDeltaM;
+        }
+
+        // Fingerprint quantization: ignore sub-threshold optical noise so Unchanged skips ToJson.
+        // Position ~0.1mm; quat/scale/radius ~1e-4. Wire JSON still uses full ToString("R").
+        private const float HandFpPosScale = 10000f;
+        private const float HandFpUnitScale = 10000f;
+        // Palm joint index (OpenXR / Pico HandJoint: Palm=0, Wrist=1).
+        private const int HandPalmJointIndex = 0;
+
+        /// <summary>
         /// Samples Hand for the aux sidechannel. False when neither hand updated this call.
         /// </summary>
         public bool TryBuildHandJson(out JsonData handJson)
         {
-            return TrySampleHand(0, buildJsonEvenIfUnchanged: true, out handJson, out _) !=
+            return TrySampleHand(0, buildJsonEvenIfUnchanged: true, out handJson, out _, out _) !=
                    HandSampleResult.Failed;
         }
 
         /// <summary>
-        /// Fingerprint raw joint floats before ToString/ToJson. Unchanged skips ~5KB alloc.
+        /// Fingerprint quantized joint floats before ToString/ToJson. Unchanged skips ~5KB alloc.
         /// </summary>
         public HandSampleResult TrySampleHand(
             ulong previousFingerprint,
@@ -192,44 +223,128 @@ namespace Robot
             out JsonData handJson,
             out ulong fingerprint)
         {
+            return TrySampleHand(
+                previousFingerprint,
+                buildJsonEvenIfUnchanged,
+                out handJson,
+                out fingerprint,
+                out _);
+        }
+
+        public HandSampleResult TrySampleHand(
+            ulong previousFingerprint,
+            bool buildJsonEvenIfUnchanged,
+            out JsonData handJson,
+            out ulong fingerprint,
+            out HandSampleInfo info)
+        {
+            return TrySampleHand(
+                previousFingerprint,
+                default(Vector3),
+                false,
+                buildJsonEvenIfUnchanged,
+                out handJson,
+                out fingerprint,
+                out info);
+        }
+
+        /// <param name="previousQuantFingerprint">Quantized fp used for publish gate.</param>
+        /// <param name="previousPalm">Previous combined palm midpoint (or best available).</param>
+        /// <param name="previousPalmValid">Whether previousPalm is usable for delta.</param>
+        public HandSampleResult TrySampleHand(
+            ulong previousQuantFingerprint,
+            Vector3 previousPalm,
+            bool previousPalmValid,
+            bool buildJsonEvenIfUnchanged,
+            out JsonData handJson,
+            out ulong fingerprint,
+            out HandSampleInfo info)
+        {
             handJson = null;
             fingerprint = 0;
-            bool leftOk = false;
-            bool rightOk = false;
-            ulong fp = 14695981039346656037UL; // FNV offset basis
+            info = default(HandSampleInfo);
+            info.PalmDeltaM = -1f;
+            ulong quantFp = 14695981039346656037UL; // FNV offset basis
+            ulong rawFp = 14695981039346656037UL;
             HandJointLocations leftHand = new HandJointLocations();
             if (PXR_HandTracking.GetJointLocations(HandType.HandLeft, ref leftHand))
             {
-                fp = MixHandFingerprint(fp, leftHand);
-                leftOk = true;
+                quantFp = MixHandFingerprint(quantFp, leftHand, quantize: true);
+                rawFp = MixHandFingerprint(rawFp, leftHand, quantize: false);
+                info.LeftOk = true;
+                info.LeftIsActive = leftHand.isActive;
+                if (TryGetPalm(leftHand, out Vector3 lp))
+                {
+                    info.LeftPalmValid = true;
+                    info.LeftPalm = lp;
+                }
             }
 
             HandJointLocations rightHand = new HandJointLocations();
             if (PXR_HandTracking.GetJointLocations(HandType.HandRight, ref rightHand))
             {
-                fp = MixHandFingerprint(fp, rightHand);
-                rightOk = true;
+                quantFp = MixHandFingerprint(quantFp, rightHand, quantize: true);
+                rawFp = MixHandFingerprint(rawFp, rightHand, quantize: false);
+                info.RightOk = true;
+                info.RightIsActive = rightHand.isActive;
+                if (TryGetPalm(rightHand, out Vector3 rp))
+                {
+                    info.RightPalmValid = true;
+                    info.RightPalm = rp;
+                }
             }
 
-            if (!leftOk && !rightOk)
+            if (!info.LeftOk && !info.RightOk)
             {
                 return HandSampleResult.Failed;
             }
 
-            fingerprint = fp;
-            bool unchanged = previousFingerprint != 0 && fp == previousFingerprint;
+            info.RawFingerprint = rawFp;
+            fingerprint = quantFp;
+
+            if (previousPalmValid)
+            {
+                Vector3 curPalm;
+                bool curOk = false;
+                if (info.LeftPalmValid && info.RightPalmValid)
+                {
+                    curPalm = 0.5f * (info.LeftPalm + info.RightPalm);
+                    curOk = true;
+                }
+                else if (info.LeftPalmValid)
+                {
+                    curPalm = info.LeftPalm;
+                    curOk = true;
+                }
+                else if (info.RightPalmValid)
+                {
+                    curPalm = info.RightPalm;
+                    curOk = true;
+                }
+                else
+                {
+                    curPalm = default(Vector3);
+                }
+
+                if (curOk)
+                {
+                    info.PalmDeltaM = Vector3.Distance(curPalm, previousPalm);
+                }
+            }
+
+            bool unchanged = previousQuantFingerprint != 0 && quantFp == previousQuantFingerprint;
             if (unchanged && !buildJsonEvenIfUnchanged)
             {
                 return HandSampleResult.Unchanged;
             }
 
-            if (leftOk)
+            if (info.LeftOk)
             {
                 GetHandTrackingData(leftHand, ref _leftHandData);
                 _handData["leftHand"] = _leftHandData;
             }
 
-            if (rightOk)
+            if (info.RightOk)
             {
                 GetHandTrackingData(rightHand, ref _rightHandData);
                 _handData["rightHand"] = _rightHandData;
@@ -239,11 +354,26 @@ namespace Robot
             return unchanged ? HandSampleResult.Unchanged : HandSampleResult.Changed;
         }
 
-        private static ulong MixHandFingerprint(ulong hash, HandJointLocations hand)
+        private static bool TryGetPalm(HandJointLocations hand, out Vector3 palm)
+        {
+            palm = default(Vector3);
+            if (hand.jointLocations == null ||
+                hand.jointCount <= HandPalmJointIndex ||
+                HandPalmJointIndex >= hand.jointLocations.Length)
+            {
+                return false;
+            }
+
+            Posef pose = hand.jointLocations[HandPalmJointIndex].pose;
+            palm = new Vector3(pose.Position.x, pose.Position.y, pose.Position.z);
+            return true;
+        }
+
+        private static ulong MixHandFingerprint(ulong hash, HandJointLocations hand, bool quantize)
         {
             hash = MixU64(hash, hand.isActive);
             hash = MixU64(hash, hand.jointCount);
-            hash = MixFloat(hash, hand.handScale);
+            hash = MixFloat(hash, hand.handScale, quantize, HandFpUnitScale);
             if (hand.jointLocations == null)
             {
                 return hash;
@@ -254,14 +384,14 @@ namespace Robot
             {
                 HandJointLocation joint = hand.jointLocations[i];
                 hash = MixU64(hash, (ulong)joint.locationStatus);
-                hash = MixFloat(hash, joint.radius);
-                hash = MixFloat(hash, joint.pose.Position.x);
-                hash = MixFloat(hash, joint.pose.Position.y);
-                hash = MixFloat(hash, joint.pose.Position.z);
-                hash = MixFloat(hash, joint.pose.Orientation.x);
-                hash = MixFloat(hash, joint.pose.Orientation.y);
-                hash = MixFloat(hash, joint.pose.Orientation.z);
-                hash = MixFloat(hash, joint.pose.Orientation.w);
+                hash = MixFloat(hash, joint.radius, quantize, HandFpUnitScale);
+                hash = MixFloat(hash, joint.pose.Position.x, quantize, HandFpPosScale);
+                hash = MixFloat(hash, joint.pose.Position.y, quantize, HandFpPosScale);
+                hash = MixFloat(hash, joint.pose.Position.z, quantize, HandFpPosScale);
+                hash = MixFloat(hash, joint.pose.Orientation.x, quantize, HandFpUnitScale);
+                hash = MixFloat(hash, joint.pose.Orientation.y, quantize, HandFpUnitScale);
+                hash = MixFloat(hash, joint.pose.Orientation.z, quantize, HandFpUnitScale);
+                hash = MixFloat(hash, joint.pose.Orientation.w, quantize, HandFpUnitScale);
             }
 
             return hash;
@@ -277,8 +407,14 @@ namespace Robot
             }
         }
 
-        private static ulong MixFloat(ulong hash, float value)
+        private static ulong MixFloat(ulong hash, float value, bool quantize, float scale)
         {
+            if (quantize)
+            {
+                int q = (int)Math.Round(value * scale);
+                return MixU64(hash, unchecked((uint)q));
+            }
+
             return MixU64(hash, unchecked((uint)BitConverter.SingleToInt32Bits(value)));
         }
 

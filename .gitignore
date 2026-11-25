@@ -82,3 +82,16 @@ PICO_logs/
 
 # Local SDK upgrade scratch
 .upgrade-3.4.0-backup/
+
+# Local agent scratch
+.cursor/
+
+# Local capture / download artifacts
+pull/
+
+# Python caches
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store

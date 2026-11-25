@@ -24,6 +24,20 @@ public class RemoteCameraWindow : MonoBehaviour
     private byte[] _imageBuffer;
     private CancellationTokenSource _receiveImageTs = null;
     private Task _imageReceiveTask;
+    private bool _listening;
+    private float _nextDecoderPollRealtime;
+    private float _nextHealthRealtime;
+    private int _decoderPolls;
+    private int _textureUpdates;
+    private int _hitchFrames;
+    private double _decoderPollTotalMs;
+    private double _decoderPollMaxMs;
+    private float _frameDeltaMaxMs;
+
+    private const float HealthIntervalSeconds = 5f;
+    private const float HitchThresholdMs = 25f;
+
+    public bool IsListening => _listening;
 
     private int _resolutionWidth = 2160;
     private int _resolutionHeight = 2160 / 2 * 4 / 3;
@@ -32,36 +46,71 @@ public class RemoteCameraWindow : MonoBehaviour
 
     public CustomButton listenBtn;
 
+    // Floating ZED/External plane: forward of the head but offset up so it does
+    // not sit on top of the main control panel (LE/RE full-face cover is off for ZED).
+    private const float HeadForwardMeters = 0.9f;
+    private const float HeadUpMeters = 0.22f;
+
     private void Awake()
     {
-        transform.position = Camera.main.transform.position;
-        transform.rotation = Camera.main.transform.rotation;
+        FollowHead(Camera.main);
     }
 
     public void StartListen(int width, int height, int fps, int bitrate, int port)
     {
+        if (_listening)
+        {
+            return;
+        }
+
+        _listening = true;
         _resolutionWidth = width;
         _resolutionHeight = height;
         _videoFps = fps;
         _bitrate = bitrate;
+        ResetPerformanceWindow();
 
         StartCoroutine(OnStartListen(port));
     }
 
     private void OnDisable()
     {
-        MediaDecoder.release();
+        StopListening();
         Debug.Log("RemoteCameraWindow OnDisable");
-        TcpHandler.SendFunctionValue("StopReceivePcCamera", "");
     }
 
     public void OnCloseBtn()
     {
-        // Reset listen button
-        listenBtn.SetOn(false);
-        // send close event to server
-        NetworkCommander.Instance.CloseCamera();
+        // Listen-off owns teardown (control socket, audio, projection).
+        if (listenBtn != null)
+        {
+            listenBtn.SetOnAndNotify(false);
+            return;
+        }
+
+        // Prefab/scene wiring missing listenBtn: still tear the local decoder down.
+        Debug.LogWarning("RemoteCameraWindow.closeBtn: listenBtn not assigned; stopping decoder only.");
+        StopListening();
         gameObject.SetActive(false);
+    }
+
+    public void StopListening()
+    {
+        if (_listening)
+        {
+            MediaDecoder.release();
+            _listening = false;
+        }
+        if (_texture != null)
+        {
+            if (RemoteCameraImage != null)
+            {
+                RemoteCameraImage.texture = null;
+            }
+            Destroy(_texture);
+            _texture = null;
+        }
+        TcpHandler.SendFunctionValue("StopReceivePcCamera", "");
     }
 
     public IEnumerator OnStartListen(int port)
@@ -88,26 +137,88 @@ public class RemoteCameraWindow : MonoBehaviour
 
     private void LateUpdate()
     {
-        //Keep the window facing the camera at all times
-        if (Camera.main != null)
+        FollowHead(Camera.main);
+    }
+
+    private void FollowHead(Camera cam)
+    {
+        if (cam == null)
         {
-            transform.position = Camera.main.transform.position;
-            transform.rotation = Camera.main.transform.rotation;
+            return;
         }
+
+        Transform head = cam.transform;
+        transform.position = head.position
+                             + head.forward * HeadForwardMeters
+                             + head.up * HeadUpMeters;
+        transform.rotation = head.rotation;
     }
 
     private void Update()
     {
-        if (_texture != null)
+        if (_texture == null || Application.platform != RuntimePlatform.Android)
         {
-            if (Application.platform == RuntimePlatform.Android)
-            {
-                if (MediaDecoder.isUpdateFrame())
-                {
-                    MediaDecoder.updateTexture();
-                    GL.InvalidateState();
-                }
-            }
+            return;
         }
+
+        float now = Time.realtimeSinceStartup;
+        float frameDeltaMs = Time.unscaledDeltaTime * 1000f;
+        _frameDeltaMaxMs = Mathf.Max(_frameDeltaMaxMs, frameDeltaMs);
+        if (frameDeltaMs >= HitchThresholdMs)
+        {
+            _hitchFrames++;
+        }
+
+        // JNI polling at the headset display refresh rate adds main-thread work
+        // without producing more video frames. Poll at twice the negotiated video
+        // rate (bounded to 30-60 Hz) and upload only when the decoder has a new frame.
+        float pollRate = Mathf.Clamp(Mathf.Max(1, _videoFps) * 2f, 30f, 60f);
+        if (now >= _nextDecoderPollRealtime)
+        {
+            _nextDecoderPollRealtime = now + 1f / pollRate;
+            long started = System.Diagnostics.Stopwatch.GetTimestamp();
+            bool hasFrame = MediaDecoder.isUpdateFrame();
+            if (hasFrame)
+            {
+                MediaDecoder.updateTexture();
+                GL.InvalidateState();
+                _textureUpdates++;
+            }
+            double elapsedMs =
+                (System.Diagnostics.Stopwatch.GetTimestamp() - started) * 1000.0 /
+                System.Diagnostics.Stopwatch.Frequency;
+            _decoderPolls++;
+            _decoderPollTotalMs += elapsedMs;
+            _decoderPollMaxMs = System.Math.Max(_decoderPollMaxMs, elapsedMs);
+        }
+
+        if (now >= _nextHealthRealtime)
+        {
+            float windowSeconds = HealthIntervalSeconds;
+            double averagePollMs = _decoderPolls > 0
+                ? _decoderPollTotalMs / _decoderPolls
+                : 0.0;
+            CrashProbe.Breadcrumb(
+                "remote_video.health",
+                $"configured={_resolutionWidth}x{_resolutionHeight}@{_videoFps} " +
+                $"bitrate={_bitrate} texture_fps={_textureUpdates / windowSeconds:F1} " +
+                $"polls={_decoderPolls} poll_avg_ms={averagePollMs:F3} " +
+                $"poll_max_ms={_decoderPollMaxMs:F3} hitch_frames={_hitchFrames} " +
+                $"frame_max_ms={_frameDeltaMaxMs:F1}");
+            ResetPerformanceWindow();
+        }
+    }
+
+    private void ResetPerformanceWindow()
+    {
+        float now = Time.realtimeSinceStartup;
+        _nextDecoderPollRealtime = now;
+        _nextHealthRealtime = now + HealthIntervalSeconds;
+        _decoderPolls = 0;
+        _textureUpdates = 0;
+        _hitchFrames = 0;
+        _decoderPollTotalMs = 0.0;
+        _decoderPollMaxMs = 0.0;
+        _frameDeltaMaxMs = 0f;
     }
 }

@@ -72,7 +72,7 @@ namespace Robot
         [SerializeField] private bool autoThrottleEnabled = true;
         // LAN default: Head@400 + Hand@~300 ≈ 1.8–2.1MB/s. Raise for wired/good Wi‑Fi;
         // lower (e.g. 1200) on weak links. Changeable in Inspector or SetBandwidthBudgetKiBps.
-        [SerializeField] private float bandwidthBudgetKiBps = 2000f;
+        [SerializeField] private float bandwidthBudgetKiBps = 2500f;
         [SerializeField] private float bandwidthRecoverMarginKiBps = 400f;
         // Start at panel-class rate; auto-throttle steps down under bandwidth pressure.
         [SerializeField] private int auxThrottleMaxHz = 400;

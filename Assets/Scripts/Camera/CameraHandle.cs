@@ -70,8 +70,14 @@ namespace Robot
                     return;
                 }
 
-                Debug.LogError("[PXRCapture] session=" + _logContext + " event=CaptureError error=" + errorCode);
-                LogWindow.Error("session=" + _logContext + " event=CaptureError error=" + errorCode);
+                string meaning = DescribeCaptureError(errorCode);
+                Debug.LogError("[PXRCapture] session=" + _logContext +
+                               " event=CaptureError error=" + errorCode + " " + meaning +
+                               " size=" + _width + "x" + _height + "@" + _fps +
+                               " bitrate=" + _bitrate + " renderMode=" + _captureRenderMode);
+                LogWindow.Error(
+                    "session=" + _logContext + " event=CaptureError error=" + errorCode +
+                    " " + meaning);
                 if (OnError != null)
                 {
                     OnError.Invoke(errorCode);
@@ -534,6 +540,25 @@ namespace Robot
         {
             string message = "session=" + _logContext + " event=" + eventName + " " + detail;
             Debug.Log("[PXRCapture] " + message);
+        }
+
+        /// <summary>
+        /// Maps PXRCapture status codes from Enterprise Constants (CAPTURE_STATUS_*).
+        /// </summary>
+        private static string DescribeCaptureError(int errorCode)
+        {
+            switch (errorCode)
+            {
+                case -100: return "name=STREAM_TIME_OUT";
+                // Native PxrCaptureServiceClient often logs the same -99 as
+                // "Miss Permission" (enterprise VST auth / runtime CAMERA), not size.
+                case -99: return "name=PREPROCESS_ERROR_OR_MISS_PERMISSION (check PxrCaptureServiceClient msg; usually enterprise camera auth or android.permission.CAMERA)";
+                case -98: return "name=RECORD_ERROR";
+                case -97: return "name=NO_PERMISSION";
+                case -96: return "name=SERVER_DIED";
+                case -95: return "name=UNKNOWN";
+                default: return "name=unmapped";
+            }
         }
     }
 }

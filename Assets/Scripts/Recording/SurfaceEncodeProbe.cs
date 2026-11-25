@@ -64,6 +64,7 @@ namespace Robot
         private int _requestedBitrateBps;
         private string _eyeMode = "LEFT";
         private bool _useEyeCrop;
+        private bool _expCrop = true;
         private bool _outputRaw;
         private bool _enableEis;
         private bool _enableMctf;
@@ -248,20 +249,21 @@ namespace Robot
         public void BeginPattern(UICameraCtrl host, int fps, bool tracking)
         {
             Begin(host, ModePatternB0, "LEFT", ProbeWidth, ProbeHeight, ProbeWidth, ProbeHeight,
-                fps, DefaultBitrateBps, tracking, false, false, false, false);
+                fps, DefaultBitrateBps, tracking, false, false, false, false, true);
         }
 
         public void BeginCamera(UICameraCtrl host, string eyeMode, int width, int height, int fps,
             int bitrateBps, bool tracking, bool outputRaw, bool enableEis, bool enableMctf,
-            bool enableMfnr, int previewWidth = EyeWidth, int previewHeight = EyeHeight)
+            bool enableMfnr, int previewWidth = EyeWidth, int previewHeight = EyeHeight,
+            bool expCrop = true)
         {
             Begin(host, ModeCameraB1, eyeMode, width, height, previewWidth, previewHeight, fps,
-                bitrateBps, tracking, outputRaw, enableEis, enableMctf, enableMfnr);
+                bitrateBps, tracking, outputRaw, enableEis, enableMctf, enableMfnr, expCrop);
         }
 
         public void Begin(UICameraCtrl host, int mode, string eyeMode, int width, int height,
             int previewWidth, int previewHeight, int fps, int bitrateBps, bool tracking,
-            bool outputRaw, bool enableEis, bool enableMctf, bool enableMfnr)
+            bool outputRaw, bool enableEis, bool enableMctf, bool enableMfnr, bool expCrop = true)
         {
             if (IsActive || host == null)
             {
@@ -277,22 +279,28 @@ namespace Robot
             _host = host;
             _mode = mode;
             _eyeMode = NormalizeEyeMode(eyeMode);
+            _expCrop = expCrop;
             if (mode == ModeCameraB1)
             {
                 int encodeW;
                 int encodeH;
-                RecordDialog.ResolveEncodeSize(_eyeMode, out encodeW, out encodeH);
+                RecordDialog.ResolveEncodeSize(_eyeMode, outputRaw, expCrop, out encodeW, out encodeH);
                 _width = encodeW;
                 _height = encodeH;
-                // Processed (raw=0) fills the requested eye buffer.
-                // Raw paints one eye into half of a 4:3 Surface (left 2:3, right black).
-                // For raw mono, preview an SBS canvas and crop that half to a full 4:3 encode.
+                // Processed (raw=0) fills the requested eye buffer (direct).
+                // Raw paints one eye into half of a SBS Surface (other half black).
+                // exp_crop=1: GLES half → 2048 encode. exp_crop=0: encode full 4096 SBS.
                 bool rawMono = outputRaw && _eyeMode != "3D";
-                _useEyeCrop = rawMono;
+                _useEyeCrop = rawMono && expCrop;
                 if (rawMono)
                 {
                     _previewWidth = SbsWidth;
                     _previewHeight = EyeHeight;
+                    if (!_useEyeCrop)
+                    {
+                        _width = SbsWidth;
+                        _height = EyeHeight;
+                    }
                 }
                 else
                 {
@@ -308,6 +316,7 @@ namespace Robot
                 _previewHeight = ProbeHeight;
                 _eyeMode = "LEFT";
                 _useEyeCrop = false;
+                _expCrop = false;
                 outputRaw = false;
                 enableEis = false;
                 enableMctf = false;
@@ -409,7 +418,9 @@ namespace Robot
             _meta["requestedHeight"] = _height;
             _meta["encodeSize"] = _width + "x" + _height;
             _meta["previewSize"] = _previewWidth + "x" + _previewHeight;
-            _meta["surfacePath"] = _useEyeCrop ? "eye-crop" : "direct";
+            _meta["exp_crop"] = _expCrop ? 1 : 0;
+            _meta["surfacePath"] = _useEyeCrop ? "eye-crop" : (_outputRaw && _eyeMode != "3D" ?
+                "raw-sbs-black" : "direct");
             _meta["cropHalf"] = !_useEyeCrop ? "none" :
                 (_eyeMode == "RIGHT" ? "right" : "left");
             if (_eyeMode == "3D")
@@ -421,6 +432,11 @@ namespace Robot
             {
                 _meta["layout"] = _eyeMode + " raw SBS half " + _previewWidth + "x" + _previewHeight +
                                   " cropped to " + _width + "x" + _height + " (4:3)";
+            }
+            else if (_outputRaw)
+            {
+                _meta["layout"] = _eyeMode + " raw full SBS " + _width + "x" + _height +
+                                  " (half content + black; exp_crop=0)";
             }
             else
             {
@@ -922,9 +938,11 @@ namespace Robot
             }
 
             _cameraOpen = true;
+            AttachCalibrationAndTransmit();
 
-            int previewW = _useEyeCrop ? _previewWidth : _width;
-            int previewH = _useEyeCrop ? _previewHeight : _height;
+            // Raw mono always previews on SBS canvas; encode may be half (crop) or full SBS.
+            int previewW = (_outputRaw && _eyeMode != "3D") ? _previewWidth : _width;
+            int previewH = (_outputRaw && _eyeMode != "3D") ? _previewHeight : _height;
             if (_useEyeCrop)
             {
                 SetStartPhase("camera_surface");
@@ -1092,7 +1110,9 @@ namespace Robot
             }
 
             _meta["surfacePassMethod"] = surfaceMethod;
-            _meta["surfacePath"] = _useEyeCrop ? "eye-crop" : "direct";
+            _meta["surfacePath"] = _useEyeCrop ? "eye-crop" : (_outputRaw && _eyeMode != "3D" ?
+                "raw-sbs-black" : "direct");
+            _meta["exp_crop"] = _expCrop ? 1 : 0;
             _meta["startPreviewPluginSize"] =
                 previewW + "x" + previewH + " passed to native startPreview";
             _meta["encodeSize"] = _width + "x" + _height;
@@ -1271,7 +1291,9 @@ namespace Robot
             _meta["height"] = _height;
             _meta["encodeSize"] = _width + "x" + _height;
             _meta["previewSize"] = _previewWidth + "x" + _previewHeight;
-            _meta["surfacePath"] = _useEyeCrop ? "eye-crop" : "direct";
+            _meta["exp_crop"] = _expCrop ? 1 : 0;
+            _meta["surfacePath"] = _useEyeCrop ? "eye-crop" : (_outputRaw && _eyeMode != "3D" ?
+                "raw-sbs-black" : "direct");
             _meta["cropHalf"] = !_useEyeCrop ? "none" :
                 (_eyeMode == "RIGHT" ? "right" : "left");
             _meta["requestedFps"] = _fps;
@@ -1487,6 +1509,75 @@ namespace Robot
                 CultureInfo.InvariantCulture, out value)
                 ? value
                 : fallback;
+        }
+
+        /// <summary>
+        /// Query for4U fx/fy/cx/cy + extrinsics into session meta/files (temporary transmit for A/B).
+        /// Per-eye size 2048×1536 is the calibration domain; no k1/k2 in SDK.
+        /// </summary>
+        private void AttachCalibrationAndTransmit()
+        {
+            int calibW = EyeWidth;
+            int calibH = EyeHeight;
+            try
+            {
+                JsonData calib = CaptureReport.CalibrationNote(calibW, calibH, true);
+                calib["encodeWidth"] = _width;
+                calib["encodeHeight"] = _height;
+                calib["previewWidth"] = _previewWidth;
+                calib["previewHeight"] = _previewHeight;
+                calib["exp_crop"] = _expCrop ? 1 : 0;
+                calib["raw"] = _outputRaw;
+                calib["eyeMode"] = _eyeMode;
+                calib["fovNote"] =
+                    "GetCameraIntrinsicsfor4U also available with h_fov=76.35 v_fov=61.05 " +
+                    "(Utils.GetCameraIntrinsicsStrE). RGBCameraParamsNew has no distortion coeffs.";
+                _meta["calibration"] = calib;
+
+                string intrinsicsE = Utils.GetCameraIntrinsicsStrE(calibW, calibH);
+                string extrinsicsE = Utils.GetCameraExtrinsicsStrE();
+                _meta["cameraIntrinsicsE"] = intrinsicsE ?? "";
+                _meta["cameraExtrinsicsE"] = extrinsicsE ?? "";
+
+                if (!string.IsNullOrEmpty(_sessionDir))
+                {
+                    string calibPath = Path.Combine(_sessionDir, "camera_calib.json");
+                    File.WriteAllText(calibPath, calib.ToJson());
+                    string bundle = "CameraExtrinsics:" + extrinsicsE + "\n" +
+                                   "cameraIntrinsics:" + intrinsicsE + "\n" +
+                                   "applicableWidth:" + calibW + "\n" +
+                                   "applicableHeight:" + calibH + "\n" +
+                                   "encodeSize:" + _width + "x" + _height + "\n" +
+                                   "exp_crop:" + (_expCrop ? 1 : 0) + "\n" +
+                                   "raw:" + (_outputRaw ? 1 : 0) + "\n" +
+                                   "eyeMode:" + _eyeMode + "\n";
+                    File.WriteAllText(Path.Combine(_sessionDir, "camera_params.txt"), bundle);
+                    // Temporary transmit copy under persistentDataPath for adb / PC pull.
+                    try
+                    {
+                        string persist = Path.Combine(Application.persistentDataPath,
+                            "camera_params_last.txt");
+                        File.WriteAllText(persist, bundle);
+                        _meta["cameraParamsPersistPath"] = persist;
+                    }
+                    catch (Exception persistEx)
+                    {
+                        _meta["cameraParamsPersistError"] = persistEx.Message;
+                    }
+
+                    _meta["cameraCalibPath"] = calibPath;
+                }
+
+                WriteMeta();
+                LogWindow.Info("[SurfaceEncodeProbe] calib fx/fy/cx/cy + extrinsics written " +
+                               "encode=" + _width + "x" + _height +
+                               " exp_crop=" + (_expCrop ? 1 : 0));
+            }
+            catch (Exception exception)
+            {
+                _meta["calibrationError"] = exception.Message;
+                Debug.LogWarning("[SurfaceEncodeProbe] calib: " + exception.Message);
+            }
         }
 
         private void WriteClockSemantics()

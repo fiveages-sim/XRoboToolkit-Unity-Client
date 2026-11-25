@@ -37,6 +37,9 @@ public class RecordDialog : MonoBehaviour
     private bool _draftEnableEis;
     private bool _draftEnableMctf;
     private bool _draftEnableMfnr;
+    /// <summary>When Raw+mono: true = GLES half-crop to 2048; false = keep full 4096 SBS with black.</summary>
+    private bool _draftExpCrop = true;
+    private bool _draftExpBuf;
     private string _draftEyeMode = "LEFT";
     private int _draftTargetFps = 30;
     private bool _expUiReady;
@@ -67,13 +70,14 @@ public class RecordDialog : MonoBehaviour
 
     public int ResolutionWidth
     {
-        get { return PlayerPrefs.GetInt("RecordResolutionWidth", 2160); }
+        // Default 2048×1536 (4:3). Old 2160×810 cropped the bottom heavily.
+        get { return PlayerPrefs.GetInt("RecordResolutionWidth", 2048); }
         set { PlayerPrefs.SetInt("RecordResolutionWidth", value); }
     }
 
     public int ResolutionHeight
     {
-        get { return PlayerPrefs.GetInt("RecordResolutionHeight", 810); }
+        get { return PlayerPrefs.GetInt("RecordResolutionHeight", 1536); }
         set { PlayerPrefs.SetInt("RecordResolutionHeight", value); }
     }
 
@@ -99,20 +103,30 @@ public class RecordDialog : MonoBehaviour
     public bool ExpEnableMctf { get; private set; }
     public bool ExpEnableMfnr { get; private set; }
 
+    /// <summary>
+    /// exp_crop: Raw+mono only. true = half-crop to 2048; false = encode full 4096 SBS (black kept).
+    /// </summary>
+    public bool ExpCrop { get; private set; } = true;
+
+    /// <summary>
+    /// exp_buf: CPU buffer dump (SetCameraFrameBufferfor4U) — closest PICO pixels, no Surface/crop.
+    /// </summary>
+    public bool ExpBuf { get; private set; }
+
     /// <summary>LEFT, RIGHT, or 3D. Used when ExpImage == 1.</summary>
     public string ExpEyeMode { get; private set; } = "LEFT";
 
     /// <summary>Requested capture/encode fps for Surface path (30 or 60).</summary>
     public int ExpTargetFps { get; private set; } = 30;
 
-    /// <summary>Encode W for Surface path: mono 2048, 3D 4096.</summary>
+    /// <summary>Encode W for Surface path (depends on eye / raw / exp_crop).</summary>
     public int ExpBufferWidth
     {
         get
         {
             int w;
             int h;
-            ResolveEncodeSize(ExpEyeMode, out w, out h);
+            ResolveEncodeSize(ExpEyeMode, ExpOutputRaw, ExpCrop, out w, out h);
             return w;
         }
     }
@@ -124,22 +138,19 @@ public class RecordDialog : MonoBehaviour
         {
             int w;
             int h;
-            ResolveEncodeSize(ExpEyeMode, out w, out h);
+            ResolveEncodeSize(ExpEyeMode, ExpOutputRaw, ExpCrop, out w, out h);
             return h;
         }
     }
 
-    /// <summary>
-    /// StartPreview canvas W: mono matches encode (2048); 3D is SBS (4096).
-    /// Mono no longer uses 4096+half-crop (that under-cropped vs 3D left eye).
-    /// </summary>
+    /// <summary>StartPreview canvas W (Raw mono always SBS 4096).</summary>
     public int ExpPreviewWidth
     {
         get
         {
             int w;
             int h;
-            ResolvePreviewSize(ExpEyeMode, out w, out h);
+            ResolvePreviewSize(ExpEyeMode, ExpOutputRaw, ExpCrop, out w, out h);
             return w;
         }
     }
@@ -151,29 +162,58 @@ public class RecordDialog : MonoBehaviour
         {
             int w;
             int h;
-            ResolvePreviewSize(ExpEyeMode, out w, out h);
+            ResolvePreviewSize(ExpEyeMode, ExpOutputRaw, ExpCrop, out w, out h);
             return h;
         }
     }
 
-    /// <summary>LEFT/RIGHT → 2048×1536; 3D → 4096×1536.</summary>
+    /// <summary>LEFT/RIGHT → 2048×1536; 3D → 4096×1536. Legacy overload (assumes crop on).</summary>
     public static void ResolveEncodeSize(string eyeMode, out int width, out int height)
+    {
+        ResolveEncodeSize(eyeMode, false, true, out width, out height);
+    }
+
+    /// <summary>
+    /// Encode size: 3D or Raw+!crop → 4096×1536 SBS; else mono eye 2048×1536.
+    /// </summary>
+    public static void ResolveEncodeSize(string eyeMode, bool outputRaw, bool expCrop,
+        out int width, out int height)
     {
         height = EyeHeight;
         if (string.Equals(eyeMode, "3D", StringComparison.OrdinalIgnoreCase))
         {
             width = SbsWidth;
+            return;
         }
-        else
+
+        // Keep official Raw half+black layout without GLES crop.
+        if (outputRaw && !expCrop)
         {
-            width = EyeWidth;
+            width = SbsWidth;
+            return;
         }
+
+        width = EyeWidth;
     }
 
-    /// <summary>Preview size equals encode size for all eyes (direct Surface path).</summary>
+    /// <summary>Preview size equals encode size (legacy).</summary>
     public static void ResolvePreviewSize(string eyeMode, out int width, out int height)
     {
-        ResolveEncodeSize(eyeMode, out width, out height);
+        ResolvePreviewSize(eyeMode, false, true, out width, out height);
+    }
+
+    /// <summary>Raw mono always previews on SBS canvas; processed matches encode.</summary>
+    public static void ResolvePreviewSize(string eyeMode, bool outputRaw, bool expCrop,
+        out int width, out int height)
+    {
+        height = EyeHeight;
+        if (outputRaw && !string.Equals(eyeMode, "3D", StringComparison.OrdinalIgnoreCase))
+        {
+            width = SbsWidth;
+            return;
+        }
+
+        ResolveEncodeSize(eyeMode, outputRaw, expCrop, out width, out height);
     }
 
     private void Start()
@@ -248,9 +288,18 @@ public class RecordDialog : MonoBehaviour
             ExpEnableEis = _draftEnableEis;
             ExpEnableMctf = _draftEnableMctf;
             ExpEnableMfnr = _draftEnableMfnr;
+            // Crop only meaningful for Raw+mono; default on for production parity.
+            ExpCrop = _draftExpCrop;
+            ExpBuf = _draftExpBuf;
             ExpEyeMode = NormalizeEyeMode(_draftEyeMode);
             ExpTargetFps = _draftTargetFps == 60 ? 60 : 30;
             Fps = ExpTargetFps;
+            // Buffer dump forces Raw semantics and ignores Surface crop.
+            if (ExpBuf)
+            {
+                ExpOutputRaw = true;
+                ExpCrop = false;
+            }
         }
         else
         {
@@ -258,6 +307,8 @@ public class RecordDialog : MonoBehaviour
             ExpEnableEis = false;
             ExpEnableMctf = false;
             ExpEnableMfnr = false;
+            ExpCrop = true;
+            ExpBuf = false;
             ExpEyeMode = "LEFT";
             ExpTargetFps = 30;
         }
@@ -291,11 +342,13 @@ public class RecordDialog : MonoBehaviour
 
     private void LoadFlagPrefsIntoDraft()
     {
-        // Defaults: Raw off, EIS off, MCTF off, MFNR on.
+        // Defaults: Raw off, EIS off, MCTF off, MFNR on, Crop on (legacy Raw mono half-crop).
         _draftOutputRaw = PlayerPrefs.GetInt("RecordExpRaw", 0) == 1;
         _draftEnableEis = PlayerPrefs.GetInt("RecordExpEis", 0) == 1;
         _draftEnableMctf = PlayerPrefs.GetInt("RecordExpMctf", 0) == 1;
         _draftEnableMfnr = PlayerPrefs.GetInt("RecordExpMfnr", 1) == 1;
+        _draftExpCrop = PlayerPrefs.GetInt("RecordExpCrop", 1) == 1;
+        _draftExpBuf = PlayerPrefs.GetInt("RecordExpBuf", 0) == 1;
         // Raw conflicts with processed-image flags; prefer Raw if both were saved on.
         if (_draftOutputRaw && (_draftEnableEis || _draftEnableMctf || _draftEnableMfnr))
         {
@@ -318,6 +371,8 @@ public class RecordDialog : MonoBehaviour
         PlayerPrefs.SetInt("RecordExpEis", _draftEnableEis ? 1 : 0);
         PlayerPrefs.SetInt("RecordExpMctf", _draftEnableMctf ? 1 : 0);
         PlayerPrefs.SetInt("RecordExpMfnr", _draftEnableMfnr ? 1 : 0);
+        PlayerPrefs.SetInt("RecordExpCrop", _draftExpCrop ? 1 : 0);
+        PlayerPrefs.SetInt("RecordExpBuf", _draftExpBuf ? 1 : 0);
     }
 
     private void SaveSurfacePrefs()
@@ -554,9 +609,9 @@ public class RecordDialog : MonoBehaviour
         }
 
         RectTransform panelRect = panel as RectTransform;
-        if (panelRect != null && panelRect.sizeDelta.y < 290f)
+        if (panelRect != null && panelRect.sizeDelta.y < 310f)
         {
-            panelRect.sizeDelta = new Vector2(panelRect.sizeDelta.x, 290f);
+            panelRect.sizeDelta = new Vector2(panelRect.sizeDelta.x, 310f);
         }
 
         if (expImageButton == null || expImageBackground == null || expImageLabel == null)
@@ -622,6 +677,10 @@ public class RecordDialog : MonoBehaviour
         {
             CreateFlagSpec("Raw", "RecordExpRaw", false,
                 () => _draftOutputRaw, v => _draftOutputRaw = v),
+            CreateFlagSpec("Crop", "RecordExpCrop", true,
+                () => _draftExpCrop, v => _draftExpCrop = v),
+            CreateFlagSpec("Buf", "RecordExpBuf", false,
+                () => _draftExpBuf, v => _draftExpBuf = v),
             CreateFlagSpec("EIS", "RecordExpEis", false,
                 () => _draftEnableEis, v => _draftEnableEis = v),
             CreateFlagSpec("MCTF", "RecordExpMctf", false,
@@ -697,6 +756,16 @@ public class RecordDialog : MonoBehaviour
                               captured.Label == "MFNR"))
             {
                 _draftOutputRaw = false;
+                _draftExpBuf = false;
+            }
+            else if (next && captured.Label == "Buf")
+            {
+                // CPU buffer path: force Raw-like, no Surface crop / processed flags.
+                _draftOutputRaw = true;
+                _draftExpCrop = false;
+                _draftEnableEis = false;
+                _draftEnableMctf = false;
+                _draftEnableMfnr = false;
             }
 
             ApplyFlagVisuals();

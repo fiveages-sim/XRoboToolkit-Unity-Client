@@ -12,8 +12,10 @@ namespace Robot
 {
     /// <summary>
     /// Samples Hand / Body / Motion on a dedicated thread into latest-only caches
-    /// for Enterprise direct main-path packing. Body/Motion follow SharedEnterpriseSampleHz;
-    /// Hand can use a lower handSampleHz to avoid 5KB JSON work at panel rate.
+    /// for Enterprise direct main-path packing.
+    /// Default: Hand and Tracker (Body/Motion) follow panel CollectionRate
+    /// (SharedEnterpriseSampleHz), same as Head/Controller. Override &gt;0 only when
+    /// deliberately decoupling. TcpHandler.autoThrottle can still lower via SharedAuxThrottleHz.
     /// Failures clear that stream's cache (no stale Hand left attached to Head packets).
     /// Wire protocol unchanged — missing Hand key means no fresh sample (same as before first hit).
     /// </summary>
@@ -23,12 +25,13 @@ namespace Robot
 
         [SerializeField] private bool autoStart = true;
         /// <summary>
-        /// Cap for Hand sampling. 0 = follow SharedEnterpriseSampleHz (recommended);
-        /// TcpHandler.autoThrottle then lowers via SharedAuxThrottleHz under bandwidth pressure.
+        /// Hand poll/publish attempt rate. 0 = follow panel SharedEnterpriseSampleHz.
         /// </summary>
-        // Cap Hand JSON build rate. 0 = follow SharedEnterpriseSampleHz (can be 300–400 and
-        // burns CPU on ToString/ToJson). 120 matches typical HF hand useful rate under B0.
-        [SerializeField] private int handSampleHz = 120;
+        [SerializeField] private int handSampleHz = 0;
+        /// <summary>
+        /// Body/Motion (tracker) poll rate. 0 = follow panel SharedEnterpriseSampleHz.
+        /// </summary>
+        [SerializeField] private int trackerSampleHz = 0;
 
         private Thread _auxThread;
         private volatile bool _running;
@@ -47,7 +50,14 @@ namespace Robot
         private static string s_lastPublishedBodyJson;
         private static string s_lastPublishedMotionJson;
         private static ulong s_lastHandFingerprint;
+        private static ulong s_lastHandRawFingerprint;
+        private static Vector3 s_lastHandPalm;
+        private static bool s_lastHandPalmValid;
         private static long s_lastHandPublishTicks;
+        // Palm |Δ| below this ⇒ treat as repeat poll of the same SDK frame (meters).
+        private const float HandNearDupPalmM = 1e-5f;
+        // Palm |Δ| at/above this ⇒ clear true motion / new recognition frame (meters).
+        private const float HandTrueChangePalmM = 5e-4f;
         private static long s_lastBodyPublishTicks;
         private static long s_lastMotionPublishTicks;
         // When a source is packet primary (no higher-priority source ready), identical JSON
@@ -99,7 +109,9 @@ namespace Robot
                 Name = nameof(EnterpriseAuxTrackingSampler)
             };
             _auxThread.Start();
-            Debug.Log($"{Tag} started (handHz={(handSampleHz > 0 ? handSampleHz.ToString() : "enterprise")}, " +
+            Debug.Log($"{Tag} started (" +
+                      $"handHz={(handSampleHz > 0 ? handSampleHz.ToString() : "panel")}, " +
+                      $"trackerHz={(trackerSampleHz > 0 ? trackerSampleHz.ToString() : "panel")}, " +
                       $"throttleCap={TcpHandler.SharedAuxThrottleHz})");
         }
 
@@ -154,6 +166,8 @@ namespace Robot
                 s_latestHandJson = null;
                 s_lastPublishedHandJson = null;
                 s_lastHandFingerprint = 0;
+                s_lastHandRawFingerprint = 0;
+                s_lastHandPalmValid = false;
                 s_handSampleSeq = 0;
                 s_lastHandPublishTicks = 0;
             }
@@ -189,6 +203,21 @@ namespace Robot
             long motionFailSinceTicks = 0;
             long handPublishCount = 0;
             long handFailCount = 0;
+            long handUnchangedCount = 0;
+            long handSampleOkCount = 0;
+            long leftOkCount = 0;
+            long rightOkCount = 0;
+            long leftActiveCount = 0;
+            long rightActiveCount = 0;
+            long activeMismatchCount = 0;
+            long oneSideMissCount = 0;
+            long handRawChangedCount = 0;
+            long handQuantChangedCount = 0;
+            long handNearDupCount = 0;
+            long handTrueChangeCount = 0;
+            long handMicroChangeCount = 0;
+            double handNearDupDeltaSum = 0.0;
+            double handTrueChangeDeltaSum = 0.0;
             long lastDiagTicks = Stopwatch.GetTimestamp();
             // Keep last good samples briefly across SDK gaps so high-rate polling does not
             // clear on every miss (PICO joints often update ~72–90Hz).
@@ -206,6 +235,21 @@ namespace Robot
                         ref motionFailSinceTicks,
                         ref handPublishCount,
                         ref handFailCount,
+                        ref handUnchangedCount,
+                        ref handSampleOkCount,
+                        ref leftOkCount,
+                        ref rightOkCount,
+                        ref leftActiveCount,
+                        ref rightActiveCount,
+                        ref activeMismatchCount,
+                        ref oneSideMissCount,
+                        ref handRawChangedCount,
+                        ref handQuantChangedCount,
+                        ref handNearDupCount,
+                        ref handTrueChangeCount,
+                        ref handMicroChangeCount,
+                        ref handNearDupDeltaSum,
+                        ref handTrueChangeDeltaSum,
                         ref lastDiagTicks);
                 }
                 catch (Exception e)
@@ -229,6 +273,21 @@ namespace Robot
             ref long motionFailSinceTicks,
             ref long handPublishCount,
             ref long handFailCount,
+            ref long handUnchangedCount,
+            ref long handSampleOkCount,
+            ref long leftOkCount,
+            ref long rightOkCount,
+            ref long leftActiveCount,
+            ref long rightActiveCount,
+            ref long activeMismatchCount,
+            ref long oneSideMissCount,
+            ref long handRawChangedCount,
+            ref long handQuantChangedCount,
+            ref long handNearDupCount,
+            ref long handTrueChangeCount,
+            ref long handMicroChangeCount,
+            ref double handNearDupDeltaSum,
+            ref double handTrueChangeDeltaSum,
             ref long lastDiagTicks)
         {
                 if (!IsSamplerActive())
@@ -257,15 +316,17 @@ namespace Robot
                 }
 
                 long nowTicks = Stopwatch.GetTimestamp();
-                int enterpriseHz = EnterpriseCollectionRecorder.SharedEnterpriseSampleHz;
+                int panelHz = EnterpriseCollectionRecorder.SharedEnterpriseSampleHz;
                 int throttleHz = TcpHandler.SharedAuxThrottleHz;
-                int configuredHandHz = handSampleHz > 0 ? handSampleHz : enterpriseHz;
-                // Auto-throttle never raises above inspector cap; can lower toward min.
+                // Panel CollectionRate is the single source of truth unless inspector override >0.
+                int configuredHandHz = handSampleHz > 0 ? handSampleHz : panelHz;
+                int configuredTrackerHz = trackerSampleHz > 0 ? trackerSampleHz : panelHz;
+                // Auto-throttle never raises above configured; can lower toward min under budget.
                 int effectiveHandHz = configuredHandHz > 0
                     ? Math.Min(configuredHandHz, throttleHz)
                     : throttleHz;
-                int effectiveBodyMotionHz = enterpriseHz > 0
-                    ? Math.Min(enterpriseHz, throttleHz)
+                int effectiveTrackerHz = configuredTrackerHz > 0
+                    ? Math.Min(configuredTrackerHz, throttleHz)
                     : throttleHz;
 
                 // Ready (not merely toggled on) decides sidecar vs primary. HeadOn with no
@@ -288,12 +349,96 @@ namespace Robot
                     bool handIsSidecar = higherPriorityReady;
                     bool keepaliveDue = !handIsSidecar && IsKeepaliveDue(
                         s_lastHandPublishTicks, nowTicks);
-                    // Fingerprint raw joints first; skip ToString("R")/ToJson when unchanged.
+                    // Dual fingerprint: raw (any float bit) vs quantized (ignore micro noise).
                     TrackingData.HandSampleResult handResult = _trackingData.TrySampleHand(
                         s_lastHandFingerprint,
+                        s_lastHandPalm,
+                        s_lastHandPalmValid,
                         buildJsonEvenIfUnchanged: false,
                         out JsonData handJson,
-                        out ulong handFingerprint);
+                        out ulong handFingerprint,
+                        out TrackingData.HandSampleInfo handInfo);
+                    if (handResult != TrackingData.HandSampleResult.Failed)
+                    {
+                        handSampleOkCount++;
+                        if (s_lastHandRawFingerprint != 0 &&
+                            handInfo.RawFingerprint != s_lastHandRawFingerprint)
+                        {
+                            handRawChangedCount++;
+                        }
+
+                        if (handResult == TrackingData.HandSampleResult.Changed)
+                        {
+                            handQuantChangedCount++;
+                        }
+
+                        if (handInfo.PalmDeltaM >= 0f)
+                        {
+                            if (handInfo.PalmDeltaM < HandNearDupPalmM)
+                            {
+                                handNearDupCount++;
+                                handNearDupDeltaSum += handInfo.PalmDeltaM;
+                            }
+                            else if (handInfo.PalmDeltaM >= HandTrueChangePalmM)
+                            {
+                                handTrueChangeCount++;
+                                handTrueChangeDeltaSum += handInfo.PalmDeltaM;
+                            }
+                            else
+                            {
+                                // Between near-dup and true-change: float noise or very slow motion.
+                                handMicroChangeCount++;
+                            }
+                        }
+
+                        // Update continuity refs for next poll (even when Unchanged).
+                        s_lastHandRawFingerprint = handInfo.RawFingerprint;
+                        if (handInfo.LeftPalmValid && handInfo.RightPalmValid)
+                        {
+                            s_lastHandPalm = 0.5f * (handInfo.LeftPalm + handInfo.RightPalm);
+                            s_lastHandPalmValid = true;
+                        }
+                        else if (handInfo.LeftPalmValid)
+                        {
+                            s_lastHandPalm = handInfo.LeftPalm;
+                            s_lastHandPalmValid = true;
+                        }
+                        else if (handInfo.RightPalmValid)
+                        {
+                            s_lastHandPalm = handInfo.RightPalm;
+                            s_lastHandPalmValid = true;
+                        }
+
+                        if (handInfo.LeftOk)
+                        {
+                            leftOkCount++;
+                            if (handInfo.LeftIsActive != 0U)
+                            {
+                                leftActiveCount++;
+                            }
+                        }
+
+                        if (handInfo.RightOk)
+                        {
+                            rightOkCount++;
+                            if (handInfo.RightIsActive != 0U)
+                            {
+                                rightActiveCount++;
+                            }
+                        }
+
+                        if (handInfo.LeftOk != handInfo.RightOk)
+                        {
+                            oneSideMissCount++;
+                        }
+
+                        if (handInfo.LeftOk && handInfo.RightOk &&
+                            (handInfo.LeftIsActive != 0U) != (handInfo.RightIsActive != 0U))
+                        {
+                            activeMismatchCount++;
+                        }
+                    }
+
                     if (handResult == TrackingData.HandSampleResult.Failed)
                     {
                         handFailCount++;
@@ -318,6 +463,7 @@ namespace Robot
                     }
                     else
                     {
+                        handUnchangedCount++;
                         handFailSinceTicks = 0;
                     }
 
@@ -352,7 +498,7 @@ namespace Robot
                         ClearBody();
                     }
 
-                    AdvanceDue(ref nextBodyTicks, nowTicks, effectiveBodyMotionHz);
+                    AdvanceDue(ref nextBodyTicks, nowTicks, effectiveTrackerHz);
                 }
                 else if (!wantBody)
                 {
@@ -389,7 +535,7 @@ namespace Robot
                         ClearMotion();
                     }
 
-                    AdvanceDue(ref nextMotionTicks, nowTicks, effectiveBodyMotionHz);
+                    AdvanceDue(ref nextMotionTicks, nowTicks, effectiveTrackerHz);
                 }
                 else if (!wantMotion)
                 {
@@ -397,7 +543,7 @@ namespace Robot
                     motionFailSinceTicks = 0;
                 }
 
-                // Loop wake: max of enabled aux cadences (Hand throttled separately).
+                // Loop wake: max of enabled aux cadences (all follow panel unless overridden).
                 int loopHz = 0;
                 if (wantHand)
                 {
@@ -406,7 +552,7 @@ namespace Robot
 
                 if (wantBody || wantMotion)
                 {
-                    loopHz = Math.Max(loopHz, effectiveBodyMotionHz);
+                    loopHz = Math.Max(loopHz, effectiveTrackerHz);
                 }
 
                 if (loopHz <= 0)
@@ -421,12 +567,63 @@ namespace Robot
                 {
                     double pubHz = handPublishCount / diagElapsed;
                     double failHz = handFailCount / diagElapsed;
+                    double unchangedHz = handUnchangedCount / diagElapsed;
+                    double leftDuty = leftOkCount > 0
+                        ? leftActiveCount / (double)leftOkCount
+                        : 0.0;
+                    double rightDuty = rightOkCount > 0
+                        ? rightActiveCount / (double)rightOkCount
+                        : 0.0;
+                    double mismatchFrac = handSampleOkCount > 0
+                        ? activeMismatchCount / (double)handSampleOkCount
+                        : 0.0;
+                    double oneSideFrac = handSampleOkCount > 0
+                        ? oneSideMissCount / (double)handSampleOkCount
+                        : 0.0;
+                    double pollHz = handSampleOkCount / diagElapsed;
+                    double rawHz = handRawChangedCount / diagElapsed;
+                    double quantHz = handQuantChangedCount / diagElapsed;
+                    double nearDupHz = handNearDupCount / diagElapsed;
+                    double trueHz = handTrueChangeCount / diagElapsed;
+                    double microHz = handMicroChangeCount / diagElapsed;
+                    double nearDupMeanMm = handNearDupCount > 0
+                        ? 1000.0 * handNearDupDeltaSum / handNearDupCount
+                        : 0.0;
+                    double trueMeanMm = handTrueChangeCount > 0
+                        ? 1000.0 * handTrueChangeDeltaSum / handTrueChangeCount
+                        : 0.0;
+                    // Resource hint: quantHz ≈ useful content rate after ignoring float noise.
+                    // trueHz ≈ clear motion frames; nearDupHz ≈ same SDK frame re-read.
                     Debug.Log($"{Tag}hand diag: effectiveHz={effectiveHandHz} " +
-                              $"throttle={throttleHz} enterprise={enterpriseHz} " +
-                              $"configured={(handSampleHz > 0 ? handSampleHz.ToString() : "0/follow")} " +
-                              $"publishHz={pubHz:F1} failHz={failHz:F1}");
+                              $"throttle={throttleHz} panel={panelHz} " +
+                              $"handCfg={(handSampleHz > 0 ? handSampleHz.ToString() : "0/panel")} " +
+                              $"trackerCfg={(trackerSampleHz > 0 ? trackerSampleHz.ToString() : "0/panel")} " +
+                              $"trackerHz={effectiveTrackerHz} " +
+                              $"publishHz={pubHz:F1} unchangedHz={unchangedHz:F1} failHz={failHz:F1} | " +
+                              $"poll={pollHz:F1} rawUnique={rawHz:F1} quantUnique={quantHz:F1} " +
+                              $"(~trueUsefulHz) nearDup={nearDupHz:F1} trueΔ={trueHz:F1} " +
+                              $"microΔ={microHz:F1} nearDupMean={nearDupMeanMm:F3}mm " +
+                              $"trueMean={trueMeanMm:F2}mm | " +
+                              $"isActive L/R duty={leftDuty:F2}/{rightDuty:F2} " +
+                              $"ok={leftOkCount}/{rightOkCount} " +
+                              $"activeMismatch={mismatchFrac:P0} oneSideMiss={oneSideFrac:P0}");
                     handPublishCount = 0;
                     handFailCount = 0;
+                    handUnchangedCount = 0;
+                    handSampleOkCount = 0;
+                    leftOkCount = 0;
+                    rightOkCount = 0;
+                    leftActiveCount = 0;
+                    rightActiveCount = 0;
+                    activeMismatchCount = 0;
+                    oneSideMissCount = 0;
+                    handRawChangedCount = 0;
+                    handQuantChangedCount = 0;
+                    handNearDupCount = 0;
+                    handTrueChangeCount = 0;
+                    handMicroChangeCount = 0;
+                    handNearDupDeltaSum = 0.0;
+                    handTrueChangeDeltaSum = 0.0;
                     lastDiagTicks = nowTicks;
                 }
 
@@ -540,6 +737,8 @@ namespace Robot
                     s_latestHandJson = null;
                     s_lastPublishedHandJson = null;
                     s_lastHandFingerprint = 0;
+                    s_lastHandRawFingerprint = 0;
+                    s_lastHandPalmValid = false;
                     s_handSampleSeq = 0;
                     s_lastHandPublishTicks = 0;
                     cleared = true;

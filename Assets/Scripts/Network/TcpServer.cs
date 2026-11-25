@@ -94,8 +94,23 @@ namespace Robot.V2.Network
 
         public void onError(string errorMessage, AndroidJavaObject exception)
         {
-            Utils.WriteLog(logTag, "Server error: " + errorMessage);
-            LogWindow.Error($"TCP Server error: {errorMessage}");
+            // Java TcpServer reports EOF/"Failed to read header" when the operator
+            // control client closes the socket. That is normal Listen teardown /
+            // renegotiate noise, not a fatal server failure.
+            bool benignDisconnect =
+                !string.IsNullOrEmpty(errorMessage) &&
+                (errorMessage.IndexOf("Failed to read header", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                 errorMessage.IndexOf("Failed to read body", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                 errorMessage.IndexOf("disconnected", StringComparison.OrdinalIgnoreCase) >= 0);
+            Utils.WriteLog(logTag, (benignDisconnect ? "Client closed: " : "Server error: ") + errorMessage);
+            if (benignDisconnect)
+            {
+                LogWindow.Warn($"TCP client closed ({errorMessage})");
+            }
+            else
+            {
+                LogWindow.Error($"TCP Server error: {errorMessage}");
+            }
             OnError?.Invoke($"{errorMessage} - {exception}");
         }
 

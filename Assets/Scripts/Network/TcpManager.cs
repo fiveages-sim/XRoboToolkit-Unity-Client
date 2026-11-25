@@ -53,8 +53,12 @@ namespace Robot.V2.Network
             tcpClient.OnDataReceived += TcpClientOnOnDataReceived;
             tcpClient.OnError += TcpClientOnOnError;
 
-            // Do not open inbound 13579 by default. Remote-camera flow uses
-            // TcpClient + UDP listen; call StartServer() explicitly if needed.
+#if !UNITY_EDITOR
+            // PICO4U headset-to-headset: the source headset must accept OPEN_CAMERA
+            // on 13579 while idle. Official main always starts this server; without
+            // it the operator Listen path connects to a closed port and stays blank.
+            StartServer();
+#endif
         }
 
         private void OnDestroy()

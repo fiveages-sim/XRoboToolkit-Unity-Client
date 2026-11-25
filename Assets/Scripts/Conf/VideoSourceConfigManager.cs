@@ -86,17 +86,11 @@ public class VideoSourceConfigManager : MonoBehaviour
                 Debug.Log($"Please ensure video_source.yml exists in Assets/StreamingAssets/");
             }
 #else
-            // In build, check persistentDataPath first, then copy from Resources if needed
+            // Always refresh from the packaged StreamingAssets copy. An older install may
+            // already have video_source.yml in persistentDataPath (e.g. only PICO4U/ZEDMINI);
+            // preferring that stale file permanently hid newer sources such as Panorama.
             yamlPath = Path.Combine(Application.persistentDataPath, yamlFileName);
-
-            if (File.Exists(yamlPath))
-            {
-                LoadConfiguration(yamlPath);
-                Debug.Log($"Load video_source.yml from {yamlPath}");
-            } else {
-                // Copy from StreamingAssets
-                CopyYamlFromStreamingAssets(yamlPath);
-            }
+            CopyYamlFromStreamingAssets(yamlPath);
 #endif
         }
         catch (Exception e)
@@ -149,21 +143,39 @@ public class VideoSourceConfigManager : MonoBehaviour
                         Directory.CreateDirectory(directory);
                     }
 
-                    // Write the content to the target path
-                    File.WriteAllText(targetPath, www.downloadHandler.text);
-                    Debug.Log($"Successfully copied video_source.yml from StreamingAssets to {targetPath}");
+                    string packaged = www.downloadHandler.text;
+                    string previous = File.Exists(targetPath) ? File.ReadAllText(targetPath) : null;
+                    if (!string.Equals(previous, packaged, StringComparison.Ordinal))
+                    {
+                        File.WriteAllText(targetPath, packaged);
+                        Debug.Log(
+                            $"Refreshed video_source.yml from StreamingAssets " +
+                            $"(persistent copy was {(previous == null ? "missing" : "stale")}).");
+                    }
+                    else
+                    {
+                        Debug.Log($"video_source.yml already matches StreamingAssets at {targetPath}");
+                    }
 
-                    // Load it
                     LoadConfiguration(targetPath);
                 }
                 catch (Exception e)
                 {
                     Debug.LogError($"Failed to write YAML file from StreamingAssets: {e.Message}");
+                    if (File.Exists(targetPath))
+                    {
+                        LoadConfiguration(targetPath);
+                    }
                 }
             }
             else
             {
                 Debug.Log($"Failed to load video_source.yml from StreamingAssets: {www.error}");
+                if (File.Exists(targetPath))
+                {
+                    Debug.Log($"Falling back to persistent video_source.yml at {targetPath}");
+                    LoadConfiguration(targetPath);
+                }
             }
         }
     }
@@ -271,7 +283,17 @@ public class VideoSourceConfigManager : MonoBehaviour
     /// <returns>List of video source names</returns>
     public List<string> GetVideoSourceNames()
     {
-        return isInitialized ? videoSources.Keys.ToList() : new List<string>();
+        if (!isInitialized)
+        {
+            return new List<string>();
+        }
+
+        // Prefer original YAML casing for the dropdown (e.g. "Panorama"), not the
+        // uppercase dictionary keys used for lookup.
+        return videoSources.Values
+            .Select(source => string.IsNullOrEmpty(source.name) ? string.Empty : source.name)
+            .Where(name => !string.IsNullOrEmpty(name))
+            .ToList();
     }
 
     /// <summary>
@@ -394,6 +416,11 @@ public class VideoSourceConfigManager : MonoBehaviour
     /// Get camera bitrate from the current video source
     /// </summary>
     public int CamBitrate => CurrentVideoSource?.GetIntProperty("CamBitrate") ?? 5000000;
+
+    /// <summary>
+    /// Raw PCM audio stream port from the operator bridge (fallback when AUDIO_CONFIG is missing).
+    /// </summary>
+    public int AudioStreamPort => CurrentVideoSource?.GetIntProperty("AudioStreamPort") ?? 13580;
 
     public float RectWidth
     {

@@ -1,6 +1,7 @@
 using System;
 using System.Collections;
 using System.IO;
+using System.Text;
 using LitJson;
 using Network;
 using Robot;
@@ -47,7 +48,9 @@ public partial class UICameraCtrl : MonoBehaviour
 
     private readonly Robot.VisionTrackingSession _session = new Robot.VisionTrackingSession();
     private readonly Robot.SurfaceEncodeProbe _surfaceProbe = new Robot.SurfaceEncodeProbe();
+    private readonly Robot.For4UBufferDumpSession _bufferDump = new Robot.For4UBufferDumpSession();
     private bool _useSurfaceProbe;
+    private bool _useBufferDump;
 
     private bool _recordTrackingData
     {
@@ -72,6 +75,14 @@ public partial class UICameraCtrl : MonoBehaviour
         // Bind event
         tcpManager.OnServerReceived += OnServerReceived;
         tcpManager.OnClientReceived += OnClientReceived;
+
+        operatorControlClient = new OperatorControlClient();
+        operatorControlClient.Connected += OnControlClientConnected;
+        operatorControlClient.Disconnected += OnControlClientDisconnected;
+        operatorControlClient.DataReceived += OnClientDataReceived;
+        operatorControlClient.Error += OnControlClientError;
+        EnsureVideoProjectionRenderer();
+        EnsureRecordStatusOverlay();
     }
 
     private void OnServerReceived(byte[] data)
@@ -155,12 +166,15 @@ public partial class UICameraCtrl : MonoBehaviour
 
             SetRemoteVisionStatus("Requesting");
             // send video stream request to the server
-            CameraSendInputDialog.Show(RequestCameraStream);
+            CameraSendInputDialog.Show(
+                RequestCameraStream,
+                cameraSource,
+                () => listenBtn.SetOn(false));
         }
         else
         {
-            RemoteCameraWindowObj.SetActive(false);
-            SetRemoteVisionStatus("Idle");
+            StopRemoteVisionSession();
+            return;
         }
 
         // Update button
@@ -169,11 +183,20 @@ public partial class UICameraCtrl : MonoBehaviour
 
     public void RequestCameraStream(string ip)
     {
-        StartCoroutine(RequestCameraStreamCoroutine(ip));
+        if (listenBtn == null || !listenBtn.On || string.IsNullOrWhiteSpace(ip))
+        {
+            LogWindow.Warn("Camera/audio request ignored because Listen is off or the operator IP is empty.");
+            return;
+        }
+
+        StopCameraRequestCoroutine();
+        cameraRequestCoroutine = StartCoroutine(RequestCameraStreamCoroutine(ip));
     }
 
     IEnumerator RequestCameraStreamCoroutine(string ip)
     {
+        int sessionId = BeginAudioSession(ip);
+
         if (TcpServer.Status == ServerStatus.Started)
         {
             // Close TcpServer first
@@ -186,25 +209,86 @@ public partial class UICameraCtrl : MonoBehaviour
         var camPara = VideoSourceConfigManager.Instance.CameraParameters;
 
         SetRemoteVisionStatus("Listening");
-        // Start listening to the camera
+        bool panoramaSource = IsCurrentSourcePanorama();
         RemoteCameraWindowObj.SetActive(true);
+        EnsureVideoProjectionRenderer();
+
+        if (panoramaSource)
+        {
+            // Skybox only — never LE/RE or floating RawImage flash.
+            setLere?.ForceSessionOff();
+            videoProjectionRenderer?.PreparePendingPanorama();
+        }
+        else
+        {
+            // PICO4U / ZEDMINI: LE/RE stereo on Listen. Right-hand B toggles near
+            // clip (ToggleCameraClippingPlane) so SBS floating window + main panel
+            // become visible again; RemoteCamera X still closes the session.
+            setLere?.BeginFlatStereoSession();
+        }
+
         RemoteCameraWindowObj.GetComponent<RemoteCameraWindow>().StartListen(camPara.width, camPara.height, camPara.fps,
             camPara.bitrate, streamingPort);
 
-        yield return new WaitForSeconds(0.2f);
+        yield return new WaitForSeconds(0.3f);
 
-        // Reset LERE
-        setLere.ResetCanvases();
+        if (panoramaSource)
+        {
+            setLere?.ForceSessionOff();
+            videoProjectionRenderer?.PreparePendingPanorama();
+        }
+        else
+        {
+            setLere?.BeginFlatStereoSession();
+        }
 
         yield return new WaitForSeconds(0.1f);
 
-        if (TcpClient.Status != ClientStatus.Connected)
+        // Reconnect for every Listen request so an existing client from another
+        // operator/profile cannot leak a stale AUDIO_CONFIG into this session.
+        if (operatorControlClient != null && operatorControlClient.IsRunning)
         {
-            // initialize TcpClient, server IP is the video source IP
-            TcpManager.Instance.StartClient(ip);
+            controlReconnectSuppressed = true;
+            operatorControlClient.DisconnectSilently();
+            controlClientConnected = false;
+            yield return new WaitForSeconds(0.1f);
         }
 
-        yield return new WaitForSeconds(0.5f);
+        controlClientConnected = false;
+        controlReconnectSuppressed = false;
+        operatorControlClient.Connect(ip, tcpManager != null ? tcpManager.port : 13579);
+        float connectDeadline = Time.realtimeSinceStartup + ControlConnectTimeoutSeconds;
+        while (sessionId == audioSessionId &&
+               listenBtn != null &&
+               listenBtn.On &&
+               !controlClientConnected &&
+               Time.realtimeSinceStartup < connectDeadline)
+        {
+            yield return null;
+        }
+
+        if (sessionId != audioSessionId ||
+            listenBtn == null ||
+            !listenBtn.On)
+        {
+            cameraRequestCoroutine = null;
+            yield break;
+        }
+
+        if (!controlClientConnected)
+        {
+            LogWindow.Warn("Operator control connection timed out; retrying.");
+            controlReconnectSuppressed = true;
+            operatorControlClient.DisconnectSilently();
+            controlReconnectSuppressed = false;
+            yield return new WaitForSecondsRealtime(ControlReconnectDelaySeconds);
+            cameraRequestCoroutine = null;
+            if (sessionId == audioSessionId && listenBtn.On)
+            {
+                RequestCameraStream(ip);
+            }
+            yield break;
+        }
 
         var localIP = Utils.GetLocalIPv4();
 
@@ -216,14 +300,40 @@ public partial class UICameraCtrl : MonoBehaviour
             VideoSourceConfigManager.Instance.CurrentVideoSource.camera,
             localIP, // local ip
             streamingPort);
-        
+
         LogWindow.Info("Requesting camera stream with config: " + customConfig.ToString());
 
-        // Utils.WriteLog(logTag, $"send camera config: {customConfig}");
         var data = CameraRequestSerializer.Serialize(customConfig);
 
-        // Use network commander
-        NetworkCommander.Instance.OpenCamera(data);
+        clientProtocolBuffer.Clear();
+        acceptAudioPortConfig = true;
+        operatorControlClient.SendCommand(
+            NetworkCommand.AUDIO_SESSION,
+            Encoding.ASCII.GetBytes(currentAudioRequestId));
+        operatorControlClient.SendCommand(NetworkCommand.OPEN_CAMERA, data);
+
+        float ackDeadline = Time.realtimeSinceStartup + AudioPortAckTimeoutSeconds;
+        while (sessionId == audioSessionId &&
+               !audioPortAckReceived &&
+               Time.realtimeSinceStartup < ackDeadline)
+        {
+            yield return null;
+        }
+
+        if (sessionId == audioSessionId)
+        {
+            if (!audioPortAckReceived)
+            {
+                acceptAudioPortConfig = false;
+                LogWindow.Warn(
+                    $"AUDIO_CONFIG timed out; using configured ports " +
+                    $"{GetRemoteAudioPort()}/{GetMicrophoneUploadPort()}.");
+            }
+
+            StartDuplexAudioForSession(ip, sessionId);
+        }
+
+        cameraRequestCoroutine = null;
     }
 
     private void OnCameraStateChanged(int state)
@@ -322,8 +432,24 @@ public partial class UICameraCtrl : MonoBehaviour
 
     private void OnDestroy()
     {
+        StopCameraRequestCoroutine();
+        StopDuplexAudio();
         TcpHandler.ReceiveFunctionEvent -= OnNetReceive;
         CameraHandle.RemoveStateListener(OnCameraStateChanged);
+        if (tcpManager != null)
+        {
+            tcpManager.OnServerReceived -= OnServerReceived;
+            tcpManager.OnClientReceived -= OnClientReceived;
+        }
+        if (operatorControlClient != null)
+        {
+            operatorControlClient.Connected -= OnControlClientConnected;
+            operatorControlClient.Disconnected -= OnControlClientDisconnected;
+            operatorControlClient.DataReceived -= OnClientDataReceived;
+            operatorControlClient.Error -= OnControlClientError;
+            operatorControlClient.Dispose();
+            operatorControlClient = null;
+        }
         if (_session.IsActive)
         {
             _session.RequestStop("object destroyed");
@@ -333,11 +459,16 @@ public partial class UICameraCtrl : MonoBehaviour
         {
             _surfaceProbe.RequestStop("object destroyed");
         }
+
+        if (_bufferDump.IsActive)
+        {
+            _bufferDump.RequestStop("object destroyed");
+        }
     }
 
     private bool AnyRecordSessionActive()
     {
-        return _session.IsActive || _surfaceProbe.IsActive;
+        return _session.IsActive || _surfaceProbe.IsActive || _bufferDump.IsActive;
     }
 
     private void OnRecordBtn(bool on)
@@ -392,7 +523,8 @@ public partial class UICameraCtrl : MonoBehaviour
                     RecordDialog.ExpEnableMctf, RecordDialog.ExpEnableMfnr,
                     RecordDialog.ExpEyeMode, RecordDialog.ExpTargetFps,
                     RecordDialog.ExpBufferWidth, RecordDialog.ExpBufferHeight,
-                    RecordDialog.ExpPreviewWidth, RecordDialog.ExpPreviewHeight);
+                    RecordDialog.ExpPreviewWidth, RecordDialog.ExpPreviewHeight,
+                    RecordDialog.ExpCrop, RecordDialog.ExpBuf);
             }, null);
         }
         else
@@ -409,9 +541,28 @@ public partial class UICameraCtrl : MonoBehaviour
         bool expOutputRaw = false, bool expEnableEis = false, bool expEnableMctf = false,
         bool expEnableMfnr = true, string eyeMode = "LEFT", int targetFps = 30,
         int bufferWidth = 2048, int bufferHeight = 1536,
-        int previewWidth = 2048, int previewHeight = 1536)
+        int previewWidth = 2048, int previewHeight = 1536,
+        bool expCrop = true, bool expBuf = false)
     {
         _useSurfaceProbe = false;
+        _useBufferDump = false;
+        if (expImage == 1 && expBuf)
+        {
+            _useBufferDump = true;
+            int saveFps = Mathf.Clamp(targetFps == 60 ? 10 : 10, 1, 30);
+            LogWindow.Info("Starting for4U CPU buffer dump (exp_buf=1) " + eyeMode +
+                           " " + Robot.For4UBufferDumpSession.DefaultWidth + "x" +
+                           Robot.For4UBufferDumpSession.DefaultHeight +
+                           " target=" + (targetFps == 60 ? 60 : 30) +
+                           " save=" + saveFps + " raw=1 (no Surface/crop)");
+            SetRecordStatus("Buf…");
+            _bufferDump.Begin(this, eyeMode,
+                Robot.For4UBufferDumpSession.DefaultWidth,
+                Robot.For4UBufferDumpSession.DefaultHeight,
+                targetFps == 60 ? 60 : 30, saveFps, true);
+            return;
+        }
+
         if (expImage == 1)
         {
             _useSurfaceProbe = true;
@@ -422,14 +573,22 @@ public partial class UICameraCtrl : MonoBehaviour
                            " preview=" + previewWidth + "x" + previewHeight +
                            "@" + surfaceFps +
                            " raw=" + (expOutputRaw ? 1 : 0) +
+                           " crop=" + (expCrop ? 1 : 0) +
                            " eis=" + (expEnableEis ? 1 : 0) +
                            " mctf=" + (expEnableMctf ? 1 : 0) +
                            " mfnr=" + (expEnableMfnr ? 1 : 0));
             SetRecordStatus("Surface…");
             _surfaceProbe.BeginCamera(this, eyeMode, bufferWidth, bufferHeight, surfaceFps,
                 surfaceBitrate, onTrackingData, expOutputRaw, expEnableEis, expEnableMctf,
-                expEnableMfnr, previewWidth, previewHeight);
+                expEnableMfnr, previewWidth, previewHeight, expCrop);
             return;
+        }
+
+        if (height > 0 && width > 0 && (width / (float)height) > 2.2f)
+        {
+            LogWindow.Info("Vision " + width + "x" + height +
+                           " is very wide — vertical FOV will look heavily cropped vs 4:3. " +
+                           "Prefer 2048x1536 or use exp_Image+Buf for PICO buffer dump.");
         }
 
         LogWindow.Info("Starting Vision StartRecord (exp_Image=0) " + width + "x" + height + "@" + fps);
@@ -465,6 +624,18 @@ public partial class UICameraCtrl : MonoBehaviour
 
     private void StopRecord()
     {
+        if (_bufferDump.IsActive)
+        {
+            _bufferDump.RequestStop("user");
+            if (_bufferDump.NeedsForceStop())
+            {
+                _bufferDump.ForceReset("user_stop");
+            }
+
+            _useBufferDump = false;
+            return;
+        }
+
         if (_surfaceProbe.IsActive)
         {
             _surfaceProbe.RequestStop("user");
@@ -490,6 +661,7 @@ public partial class UICameraCtrl : MonoBehaviour
         }
 
         _useSurfaceProbe = false;
+        _useBufferDump = false;
         SetRecordVisual("idle");
     }
 
@@ -509,6 +681,14 @@ public partial class UICameraCtrl : MonoBehaviour
 
     private void Update()
     {
+        RunControlConnectionWatchdog();
+
+        if (_useBufferDump || _bufferDump.IsActive)
+        {
+            _bufferDump.Pump();
+            return;
+        }
+
         if (_useSurfaceProbe || _surfaceProbe.IsActive)
         {
             _surfaceProbe.Pump();
@@ -524,19 +704,43 @@ public partial class UICameraCtrl : MonoBehaviour
 
     private void OnApplicationPause(bool pauseStatus)
     {
-        if (!pauseStatus)
+        if (pauseStatus)
         {
-            return;
+            resumeDuplexAudioAfterPause = listenBtn != null &&
+                                          listenBtn.On &&
+                                          !string.IsNullOrEmpty(activeAudioHost);
+            StopDuplexAudio(false);
+            controlReconnectSuppressed = true;
+            if (operatorControlClient != null && operatorControlClient.IsRunning)
+            {
+                operatorControlClient.DisconnectSilently();
+            }
+            controlClientConnected = false;
+
+            if (_bufferDump.IsActive)
+            {
+                _bufferDump.RequestStop("application paused");
+            }
+
+            if (_surfaceProbe.IsActive)
+            {
+                _surfaceProbe.RequestStop("application paused");
+            }
+
+            if (_session.IsActive)
+            {
+                _session.RequestStop("application paused");
+            }
         }
 
-        if (_surfaceProbe.IsActive)
+        if (!pauseStatus &&
+            resumeDuplexAudioAfterPause &&
+            listenBtn != null &&
+            listenBtn.On &&
+            !string.IsNullOrEmpty(activeAudioHost))
         {
-            _surfaceProbe.RequestStop("application paused");
-        }
-
-        if (_session.IsActive)
-        {
-            _session.RequestStop("application paused");
+            RequestCameraStream(activeAudioHost);
+            resumeDuplexAudioAfterPause = false;
         }
     }
 }
